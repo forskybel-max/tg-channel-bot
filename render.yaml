@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tg-channel-shop-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHANNEL_URL
+        sync: false
