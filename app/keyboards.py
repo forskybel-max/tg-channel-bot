@@ -395,7 +395,6 @@ def build_admin_main_kb(pending_orders: int = 0) -> InlineKeyboardMarkup:
 
 def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     req_sub = "🟢 Вкл" if settings.get("require_sub") == "1" else "🔴 Выкл"
-    users_cnt = "🟢 Вкл" if settings.get("show_users_count", "1") == "1" else "🔴 Выкл"
     paid_sec = "🟢 Виден" if settings.get("show_paid_section") == "1" else "🔴 Скрыт"
     stars_on = "🟢 Вкл" if settings.get("enable_stars") == "1" else "🔴 Выкл"
     manual_on = "🟢 Вкл" if settings.get("enable_manual_pay") == "1" else "🔴 Выкл"
@@ -420,15 +419,6 @@ def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
                     text="🔗 Ссылка на канал",
                     callback_data="adm:set_edit:channel_url",
                 ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"👥 Счетчик участников сверху: {users_cnt}",
-                    callback_data="adm:set_toggle:show_users_count",
-                    style=ButtonStyle.PRIMARY
-                    if settings.get("show_users_count", "1") == "1"
-                    else None,
-                )
             ],
             [
                 InlineKeyboardButton(

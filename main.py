@@ -43,14 +43,11 @@ async def start_healthcheck_server(port: int) -> web.AppRunner:
 
 
 async def refresh_bot_profile_counter(bot: Bot, db: Database) -> None:
-    """Обновляет счетчик участников в шапке профиля бота (Short Description)."""
+    """Устанавливает аккуратное краткое описание профиля бота."""
     try:
-        cnt = await db.get_total_users_count()
-        formatted = f"{max(1, cnt):,}".replace(",", " ")
-        short_desc = (
-            f"👥 Участников: {formatted} • Бесплатные гайды и база материалов @neuro_admin_official"
+        await bot.set_my_short_description(
+            short_description="Бесплатные гайды и база материалов канала @neuro_admin_official"
         )
-        await bot.set_my_short_description(short_description=short_desc[:120])
     except Exception:
         pass
 

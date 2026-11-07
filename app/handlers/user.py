@@ -273,14 +273,6 @@ def setup_user_router(config: Config, db: Database) -> Router:
         )
         welcome_photo = settings.get("welcome_photo_id", "").strip()
 
-        if settings.get("show_users_count", "1") == "1":
-            total_users = await db.get_total_users_count()
-            formatted_cnt = f"{max(1, total_users):,}".replace(",", " ")
-            welcome_text = (
-                f"<blockquote>👥 Участников в боте: <b>{formatted_cnt}</b></blockquote>\n\n"
-                f"{welcome_text}"
-            )
-
         kb = build_main_menu_kb(
             show_paid_section=show_paid,
             is_admin=user_id in config.admin_ids,
