@@ -1,5 +1,6 @@
 import html
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, F, Router
@@ -50,6 +51,23 @@ class SubscriptionGateMiddleware(BaseMiddleware):
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
+        self._seen_users_ts: dict[int, float] = {}
+
+    async def _touch_user(
+        self, user_id: int, username: str, full_name: str, payload: str = ""
+    ) -> None:
+        now = time.monotonic()
+        last_ts = self._seen_users_ts.get(user_id)
+        if payload or last_ts is None or (now - last_ts) > 600.0:
+            await self.db.upsert_user(
+                user_id=user_id,
+                username=username,
+                full_name=full_name,
+                source_param=payload,
+            )
+            if len(self._seen_users_ts) > 10000:
+                self._seen_users_ts.clear()
+            self._seen_users_ts[user_id] = now
 
     async def __call__(
         self,
@@ -75,11 +93,11 @@ class SubscriptionGateMiddleware(BaseMiddleware):
                 if len(parts) > 1:
                     payload = parts[1].strip()
 
-            await self.db.upsert_user(
+            await self._touch_user(
                 user_id=user.id,
                 username=user.username or "",
                 full_name=user.full_name or "",
-                source_param=payload,
+                payload=payload,
             )
 
             if user.id in self.config.admin_ids:
@@ -105,7 +123,7 @@ class SubscriptionGateMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             user = event.from_user
-            await self.db.upsert_user(
+            await self._touch_user(
                 user_id=user.id,
                 username=user.username or "",
                 full_name=user.full_name or "",
@@ -263,6 +281,14 @@ def setup_user_router(config: Config, db: Database) -> Router:
     sub_mw = SubscriptionGateMiddleware(config=config, db=db)
     router.message.middleware(sub_mw)
     router.callback_query.middleware(sub_mw)
+    cached_bot_username = ""
+
+    async def get_bot_username(bot: Bot) -> str:
+        nonlocal cached_bot_username
+        if not cached_bot_username:
+            me = await bot.get_me()
+            cached_bot_username = me.username or ""
+        return cached_bot_username
 
     async def show_home(event: Message | CallbackQuery, user_id: int) -> None:
         settings = await db.get_all_settings()
@@ -288,7 +314,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
     ) -> None:
         settings = await db.get_all_settings()
         has_access = await db.has_access(user_id, item["id"])
-        me = await bot.get_me()
+        bot_uname = await get_bot_username(bot) if user_id in config.admin_ids else ""
 
         if item.get("category_id"):
             sec = "shop" if item.get("is_paid") else "guides"
@@ -303,7 +329,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
             settings=settings,
             back_callback=back_cb,
             is_admin=user_id in config.admin_ids,
-            bot_username=me.username or "",
+            bot_username=bot_uname,
         )
         await render_screen(
             event,
@@ -336,7 +362,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
         call: CallbackQuery, state: FSMContext, bot: Bot
     ) -> None:
         is_sub, ch_url = await check_user_subscription(
-            bot, db, call.from_user.id, config.admin_ids
+            bot, db, call.from_user.id, config.admin_ids, force_refresh=True
         )
         if not is_sub:
             await call.answer(

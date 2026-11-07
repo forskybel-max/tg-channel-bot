@@ -9,6 +9,8 @@ from app.database import Database
 logger = logging.getLogger(__name__)
 
 _last_admin_warn_ts: float = 0.0
+_sub_ok_cache: dict[tuple[str, int], float] = {}
+SUB_CACHE_TTL_SEC = 90.0
 
 
 def _parse_chat_id(raw: str) -> int | str:
@@ -23,11 +25,15 @@ def _parse_chat_id(raw: str) -> int | str:
 
 
 async def check_user_subscription(
-    bot: Bot, db: Database, user_id: int, admin_ids: list[int]
+    bot: Bot,
+    db: Database,
+    user_id: int,
+    admin_ids: list[int],
+    force_refresh: bool = False,
 ) -> tuple[bool, str]:
     """
     Проверяет подписку пользователя на обязательный канал.
-    Возвращает (is_subscribed, channel_url).
+    Кэширует положительный результат на 90 сек, чтобы кнопки работали мгновенно без повторных HTTP-вызовов.
     """
     global _last_admin_warn_ts
 
@@ -53,19 +59,31 @@ async def check_user_subscription(
                 else f"https://{raw_channel_id}"
             )
 
+    now = time.monotonic()
+    cache_key = (raw_channel_id, user_id)
+    if not force_refresh:
+        cached_at = _sub_ok_cache.get(cache_key)
+        if cached_at is not None and (now - cached_at) < SUB_CACHE_TTL_SEC:
+            return True, channel_url
+
     chat_id = _parse_chat_id(raw_channel_id)
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        if member.status in (
+        is_member = member.status in (
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
-        ):
+        ) or (
+            member.status == ChatMemberStatus.RESTRICTED
+            and getattr(member, "is_member", False)
+        )
+        if is_member:
+            if len(_sub_ok_cache) > 5000:
+                _sub_ok_cache.clear()
+            _sub_ok_cache[cache_key] = now
             return True, channel_url
-        if member.status == ChatMemberStatus.RESTRICTED and getattr(
-            member, "is_member", False
-        ):
-            return True, channel_url
+
+        _sub_ok_cache.pop(cache_key, None)
         return False, channel_url
     except TelegramAPIError as exc:
         logger.warning(
@@ -73,7 +91,6 @@ async def check_user_subscription(
             raw_channel_id,
             exc,
         )
-        now = time.monotonic()
         if now - _last_admin_warn_ts > 600:
             _last_admin_warn_ts = now
             me = await bot.get_me()

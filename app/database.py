@@ -1,4 +1,5 @@
 import ssl
+import time
 from typing import Any
 from urllib.parse import urlparse
 import asyncpg
@@ -26,6 +27,8 @@ class Database:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self.pool: asyncpg.Pool | None = None
+        self._settings_cache: dict[str, str] | None = None
+        self._settings_cache_ts: float = 0.0
 
     async def connect(self) -> None:
         parsed = urlparse(self.database_url)
@@ -171,17 +174,23 @@ class Database:
                     v,
                 )
 
-    # --- Настройки ---
+    # --- Настройки (с in-memory кэшем на 60 сек для мгновенного отклика кнопок) ---
 
     async def get_setting(self, key: str, default: str = "") -> str:
-        pool = self._require_pool()
-        val = await pool.fetchval("SELECT value FROM bot_settings WHERE key = $1", key)
-        return val if val is not None else default
+        settings = await self.get_all_settings()
+        return settings.get(key, default)
 
     async def get_all_settings(self) -> dict[str, str]:
+        now = time.monotonic()
+        if self._settings_cache is not None and (now - self._settings_cache_ts) < 60.0:
+            return dict(self._settings_cache)
+
         pool = self._require_pool()
         rows = await pool.fetch("SELECT key, value FROM bot_settings")
-        return {r["key"]: r["value"] for r in rows}
+        data = {r["key"]: r["value"] for r in rows}
+        self._settings_cache = data
+        self._settings_cache_ts = now
+        return dict(data)
 
     async def set_setting(self, key: str, value: str) -> None:
         pool = self._require_pool()
@@ -193,6 +202,7 @@ class Database:
             key,
             value,
         )
+        self._settings_cache = None
 
     # --- Пользователи и статистика ---
 

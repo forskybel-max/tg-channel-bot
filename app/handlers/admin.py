@@ -82,6 +82,7 @@ def _extract_media(message: Message) -> tuple[str, str]:
 
 def setup_admin_router(config: Config, db: Database) -> Router:
     router = Router(name="admin")
+    cached_bot_username = ""
 
     # Глобальный фильтр прав администратора на весь роутер
     router.message.filter(F.from_user.id.in_(config.admin_ids))
@@ -112,8 +113,11 @@ def setup_admin_router(config: Config, db: Database) -> Router:
                 await event.answer("Материал не найден", show_alert=True)
             return
 
-        me = await bot.get_me()
-        bot_username = me.username or ""
+        nonlocal cached_bot_username
+        if not cached_bot_username:
+            me = await bot.get_me()
+            cached_bot_username = me.username or ""
+        bot_username = cached_bot_username
         deep_link = f"https://t.me/{bot_username}?start=item_{item['id']}"
 
         kind_str = "💎 Платный товар" if item.get("is_paid") else "📘 Бесплатный гайд"
