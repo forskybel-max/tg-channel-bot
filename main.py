@@ -42,10 +42,25 @@ async def start_healthcheck_server(port: int) -> web.AppRunner:
     return runner
 
 
-async def keep_alive_task() -> None:
-    """Опциональный self-ping для бесплатных облачных тарифов (если задан RENDER_EXTERNAL_URL)."""
+async def refresh_bot_profile_counter(bot: Bot, db: Database) -> None:
+    """Обновляет счетчик участников в шапке профиля бота (Short Description)."""
+    try:
+        cnt = await db.get_total_users_count()
+        formatted = f"{max(1, cnt):,}".replace(",", " ")
+        short_desc = (
+            f"👥 Участников: {formatted} • Бесплатные гайды и база материалов @neuro_admin_official"
+        )
+        await bot.set_my_short_description(short_description=short_desc[:120])
+    except Exception:
+        pass
+
+
+async def keep_alive_task(bot: Bot, db: Database) -> None:
+    """Периодический self-ping для бесплатного облака и обновление счетчика в профиле бота."""
+    tick = 0
     while True:
         await asyncio.sleep(600)
+        tick += 1
         external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
         if external_url:
             try:
@@ -54,6 +69,8 @@ async def keep_alive_task() -> None:
                         pass
             except Exception:
                 pass
+        if tick % 3 == 0:  # каждые 30 минут
+            await refresh_bot_profile_counter(bot, db)
 
 
 async def configure_bot_commands(bot: Bot, admin_ids: list[int]) -> None:
@@ -66,7 +83,9 @@ async def configure_bot_commands(bot: Bot, admin_ids: list[int]) -> None:
         await bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
         for aid in admin_ids:
             try:
-                await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=aid))
+                await bot.set_my_commands(
+                    admin_cmds, scope=BotCommandScopeChat(chat_id=aid)
+                )
             except Exception:
                 pass
     except Exception:
@@ -104,9 +123,10 @@ async def main() -> None:
     if port_env.isdigit():
         health_runner = await start_healthcheck_server(int(port_env))
 
-    ping_task = asyncio.create_task(keep_alive_task())
-
     await configure_bot_commands(bot, config.admin_ids)
+    await refresh_bot_profile_counter(bot, db)
+    ping_task = asyncio.create_task(keep_alive_task(bot, db))
+
     me = await bot.get_me()
     logger.info("====================================================")
     logger.info("БОТ ЗАПУЩЕН: @%s", me.username)

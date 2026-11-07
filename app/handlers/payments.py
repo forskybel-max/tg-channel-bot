@@ -17,7 +17,7 @@ from aiogram.types import (
 
 from app.config import Config
 from app.database import Database
-from app.handlers.user import render_screen
+from app.handlers.user import SubscriptionGateMiddleware, render_screen
 from app.keyboards import (
     build_cancel_kb,
     build_manual_pay_kb,
@@ -39,6 +39,7 @@ def _strip_html(raw: str) -> str:
 
 def setup_payments_router(config: Config, db: Database) -> Router:
     router = Router(name="payments")
+    router.callback_query.middleware(SubscriptionGateMiddleware(config=config, db=db))
 
     # ==========================================
     # 1. TELEGRAM STARS (XTR)

@@ -70,6 +70,6 @@ def load_config() -> Config:
         bot_token=bot_token,
         admin_ids=_parse_admin_ids(admin_ids_raw),
         database_url=database_url,
-        default_channel_id=os.getenv("CHANNEL_ID", "").strip(),
-        default_channel_url=os.getenv("CHANNEL_URL", "").strip(),
+        default_channel_id=os.getenv("CHANNEL_ID", "@neuro_admin_official").strip() or "@neuro_admin_official",
+        default_channel_url=os.getenv("CHANNEL_URL", "https://t.me/neuro_admin_official").strip() or "https://t.me/neuro_admin_official",
     )

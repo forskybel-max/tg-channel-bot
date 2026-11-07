@@ -1,11 +1,11 @@
 import html
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, F, Router
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.enums import ButtonStyle
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -14,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    TelegramObject,
 )
 
 from app.config import Config
@@ -32,9 +33,112 @@ from app.services.subscription import check_user_subscription
 
 logger = logging.getLogger(__name__)
 
+SUB_GATE_TEXT = (
+    "🔒 <b>Доступ к боту открыт только для подписчиков канала!</b>\n\n"
+    "Чтобы пользоваться ботом, открывать бесплатные гайды и базу материалов, "
+    "подпишитесь на наш канал и нажмите зелёную кнопку проверки ниже 👇"
+)
+
 
 class UserStates(StatesGroup):
     waiting_support_msg = State()
+
+
+class SubscriptionGateMiddleware(BaseMiddleware):
+    """Глобальная проверка подписки на канал перед любым взаимодействием с ботом."""
+
+    def __init__(self, config: Config, db: Database):
+        self.config = config
+        self.db = db
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        bot: Bot | None = data.get("bot")
+        if bot is None:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            if event.successful_payment:
+                return await handler(event, data)
+
+            user = event.from_user
+            if not user:
+                return await handler(event, data)
+
+            payload = ""
+            if event.text and event.text.startswith("/start"):
+                parts = event.text.split(maxsplit=1)
+                if len(parts) > 1:
+                    payload = parts[1].strip()
+
+            await self.db.upsert_user(
+                user_id=user.id,
+                username=user.username or "",
+                full_name=user.full_name or "",
+                source_param=payload,
+            )
+
+            if user.id in self.config.admin_ids:
+                return await handler(event, data)
+
+            is_sub, ch_url = await check_user_subscription(
+                bot, self.db, user.id, self.config.admin_ids
+            )
+            if not is_sub:
+                retry_target = (
+                    payload
+                    if payload.startswith("item_") and len(payload) < 32
+                    else "home"
+                )
+                await render_screen(
+                    event,
+                    SUB_GATE_TEXT,
+                    build_sub_gate_kb(ch_url, f"sub:check:{retry_target}"),
+                )
+                return None
+
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            user = event.from_user
+            await self.db.upsert_user(
+                user_id=user.id,
+                username=user.username or "",
+                full_name=user.full_name or "",
+            )
+
+            cb_data = event.data or ""
+            if user.id in self.config.admin_ids or cb_data.startswith("sub:check:"):
+                return await handler(event, data)
+
+            is_sub, ch_url = await check_user_subscription(
+                bot, self.db, user.id, self.config.admin_ids
+            )
+            if not is_sub:
+                await event.answer(
+                    "Для работы с ботом необходимо подписаться на канал!",
+                    show_alert=True,
+                )
+                retry_target = "home"
+                if cb_data.startswith(("item:view:", "item:claim:")):
+                    raw_id = cb_data.split(":")[-1]
+                    if raw_id.isdigit():
+                        retry_target = f"item_{raw_id}"
+
+                await render_screen(
+                    event,
+                    SUB_GATE_TEXT,
+                    build_sub_gate_kb(ch_url, f"sub:check:{retry_target}"),
+                )
+                return None
+
+            return await handler(event, data)
+
+        return await handler(event, data)
 
 
 async def render_screen(
@@ -73,7 +177,6 @@ async def render_screen(
             )
         return
 
-    # CallbackQuery
     msg = event.message
     if msg is None:
         return
@@ -101,7 +204,6 @@ async def render_screen(
         if "message is not modified" in str(exc).lower():
             return
 
-    # Если переход между фото <-> текстом или старым сообщением выдачи файла
     try:
         await msg.delete()
     except TelegramBadRequest:
@@ -134,7 +236,9 @@ async def render_screen(
         )
 
 
-def format_item_card_text(item: dict[str, Any], settings: dict[str, str], has_access: bool) -> str:
+def format_item_card_text(
+    item: dict[str, Any], settings: dict[str, str], has_access: bool
+) -> str:
     icon = "💎" if item.get("is_paid") else "📘"
     title = html.escape(item.get("title", "Материал"))
     desc = (item.get("description") or "").strip()
@@ -156,13 +260,26 @@ def format_item_card_text(item: dict[str, Any], settings: dict[str, str], has_ac
 
 def setup_user_router(config: Config, db: Database) -> Router:
     router = Router(name="user")
+    sub_mw = SubscriptionGateMiddleware(config=config, db=db)
+    router.message.middleware(sub_mw)
+    router.callback_query.middleware(sub_mw)
 
     async def show_home(event: Message | CallbackQuery, user_id: int) -> None:
         settings = await db.get_all_settings()
         show_paid = settings.get("show_paid_section", "0") == "1"
         channel_url = settings.get("channel_url", "").strip()
-        welcome_text = settings.get("welcome_text", "").strip() or "👋 Добро пожаловать!"
+        welcome_text = (
+            settings.get("welcome_text", "").strip() or "👋 Добро пожаловать!"
+        )
         welcome_photo = settings.get("welcome_photo_id", "").strip()
+
+        if settings.get("show_users_count", "1") == "1":
+            total_users = await db.get_total_users_count()
+            formatted_cnt = f"{max(1, total_users):,}".replace(",", " ")
+            welcome_text = (
+                f"<blockquote>👥 Участников в боте: <b>{formatted_cnt}</b></blockquote>\n\n"
+                f"{welcome_text}"
+            )
 
         kb = build_main_menu_kb(
             show_paid_section=show_paid,
@@ -203,6 +320,60 @@ def setup_user_router(config: Config, db: Database) -> Router:
             photo_id=item.get("cover_photo_id", ""),
         )
 
+    async def handle_item_deeplink(
+        event: Message | CallbackQuery,
+        bot: Bot,
+        user_id: int,
+        chat_id: int,
+        item_id: int,
+    ) -> bool:
+        item = await db.get_item(item_id)
+        if not item or (not item.get("is_active") and user_id not in config.admin_ids):
+            return False
+
+        if not item.get("is_paid"):
+            await db.grant_access(user_id, item["id"], access_type="free")
+            await deliver_item_content(bot, chat_id, item)
+            return True
+
+        await show_item_card(event, bot, user_id, item)
+        return True
+
+    @router.callback_query(F.data.startswith("sub:check:"))
+    async def cb_sub_check(
+        call: CallbackQuery, state: FSMContext, bot: Bot
+    ) -> None:
+        is_sub, ch_url = await check_user_subscription(
+            bot, db, call.from_user.id, config.admin_ids
+        )
+        if not is_sub:
+            await call.answer(
+                "❌ Подписка пока не найдена! Подпишитесь на канал и нажмите кнопку ещё раз.",
+                show_alert=True,
+            )
+            return
+
+        await state.clear()
+        await call.answer("✅ Подписка подтверждена! Добро пожаловать!")
+
+        parts = (call.data or "").split(":", maxsplit=2)
+        target = parts[2] if len(parts) == 3 else "home"
+
+        if target.startswith("item_") and call.message:
+            raw_id = target[len("item_") :]
+            if raw_id.isdigit():
+                try:
+                    await call.message.delete()
+                except TelegramBadRequest:
+                    pass
+                handled = await handle_item_deeplink(
+                    call, bot, call.from_user.id, call.message.chat.id, int(raw_id)
+                )
+                if handled:
+                    return
+
+        await show_home(call, call.from_user.id)
+
     @router.message(CommandStart())
     async def cmd_start(
         message: Message, command: CommandObject, state: FSMContext, bot: Bot
@@ -213,42 +384,13 @@ def setup_user_router(config: Config, db: Database) -> Router:
             return
 
         payload = (command.args or "").strip()
-        await db.upsert_user(
-            user_id=user.id,
-            username=user.username or "",
-            full_name=user.full_name or "",
-            source_param=payload,
-        )
-
-        # Обработка прямых ссылок из постов канала: ?start=item_12
         if payload.startswith("item_"):
             raw_id = payload[len("item_") :]
             if raw_id.isdigit():
-                item = await db.get_item(int(raw_id))
-                if item and (item.get("is_active") or user.id in config.admin_ids):
-                    if not item.get("is_paid"):
-                        is_sub, ch_url = await check_user_subscription(
-                            bot, db, user.id, config.admin_ids
-                        )
-                        if not is_sub:
-                            gate_text = (
-                                f"🔒 Чтобы бесплатно забрать материал <b>«{html.escape(item['title'])}»</b>, "
-                                "подпишитесь на наш Telegram-канал и нажмите зелёную кнопку ниже:"
-                            )
-                            await message.answer(
-                                gate_text,
-                                parse_mode="HTML",
-                                reply_markup=build_sub_gate_kb(
-                                    ch_url, f"item:claim:{item['id']}"
-                                ),
-                            )
-                            return
-                        await db.grant_access(user.id, item["id"], access_type="free")
-                        await deliver_item_content(bot, message.chat.id, item)
-                        return
-
-                    # Платный материал — показываем карточку товара
-                    await show_item_card(message, bot, user.id, item)
+                handled = await handle_item_deeplink(
+                    message, bot, user.id, message.chat.id, int(raw_id)
+                )
+                if handled:
                     return
 
         await show_home(message, user.id)
@@ -267,7 +409,9 @@ def setup_user_router(config: Config, db: Database) -> Router:
         is_paid = section == "shop"
 
         settings = await db.get_all_settings()
-        categories = await db.get_categories(section=section, only_with_active_items=True)
+        categories = await db.get_categories(
+            section=section, only_with_active_items=True
+        )
         uncat_items = await db.get_catalog_items(
             is_paid=is_paid, uncategorized_only=True
         )
@@ -332,7 +476,9 @@ def setup_user_router(config: Config, db: Database) -> Router:
             await call.answer()
             return
         item = await db.get_item(int(raw_id))
-        if not item or (not item.get("is_active") and call.from_user.id not in config.admin_ids):
+        if not item or (
+            not item.get("is_active") and call.from_user.id not in config.admin_ids
+        ):
             await call.answer("Материал недоступен", show_alert=True)
             return
         await call.answer()
@@ -352,23 +498,6 @@ def setup_user_router(config: Config, db: Database) -> Router:
         if item.get("is_paid"):
             await call.answer("Этот материал платный", show_alert=True)
             await show_item_card(call, bot, call.from_user.id, item)
-            return
-
-        is_sub, ch_url = await check_user_subscription(
-            bot, db, call.from_user.id, config.admin_ids
-        )
-        if not is_sub:
-            await call.answer("Подпишитесь на канал, чтобы забрать гайд!", show_alert=True)
-            gate_text = (
-                f"🔒 Для доступа к материалу <b>«{html.escape(item['title'])}»</b> "
-                "необходимо быть подписчиком нашего канала.\n\n"
-                "Подпишитесь и нажмите кнопку проверки ниже 👇"
-            )
-            await render_screen(
-                call,
-                gate_text,
-                build_sub_gate_kb(ch_url, f"item:claim:{item['id']}"),
-            )
             return
 
         await call.answer("Готово! Отправляю материал 🎁")

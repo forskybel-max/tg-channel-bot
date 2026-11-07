@@ -1,4 +1,5 @@
 import logging
+import time
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramAPIError
@@ -6,6 +7,8 @@ from aiogram.exceptions import TelegramAPIError
 from app.database import Database
 
 logger = logging.getLogger(__name__)
+
+_last_admin_warn_ts: float = 0.0
 
 
 def _parse_chat_id(raw: str) -> int | str:
@@ -26,6 +29,8 @@ async def check_user_subscription(
     Проверяет подписку пользователя на обязательный канал.
     Возвращает (is_subscribed, channel_url).
     """
+    global _last_admin_warn_ts
+
     if user_id in admin_ids:
         return True, ""
 
@@ -38,8 +43,15 @@ async def check_user_subscription(
         return True, ""
 
     channel_url = settings.get("channel_url", "").strip()
-    if not channel_url and raw_channel_id.startswith("@"):
-        channel_url = f"https://t.me/{raw_channel_id.lstrip('@')}"
+    if not channel_url:
+        if raw_channel_id.startswith("@"):
+            channel_url = f"https://t.me/{raw_channel_id.lstrip('@')}"
+        elif "t.me/" in raw_channel_id:
+            channel_url = (
+                raw_channel_id
+                if raw_channel_id.startswith("http")
+                else f"https://{raw_channel_id}"
+            )
 
     chat_id = _parse_chat_id(raw_channel_id)
     try:
@@ -57,9 +69,23 @@ async def check_user_subscription(
         return False, channel_url
     except TelegramAPIError as exc:
         logger.warning(
-            "Не удалось проверить подписку на канал %s (убедитесь, что бот добавлен в админы канала!): %s",
+            "Не удалось проверить подписку на канал %s (добавьте бота в админы канала!): %s",
             raw_channel_id,
             exc,
         )
-        # Не блокируем выдачу материала, если админ еще не выдал боту права в канале
+        now = time.monotonic()
+        if now - _last_admin_warn_ts > 600:
+            _last_admin_warn_ts = now
+            me = await bot.get_me()
+            warn_msg = (
+                f"⚠️ <b>Внимание: не работает проверка подписки на {raw_channel_id}!</b>\n\n"
+                f"Telegram вернул ошибку доступа к списку участников канала.\n"
+                f"Добавьте бота <b>@{me.username}</b> в <b>Администраторы</b> канала "
+                f"<code>{raw_channel_id}</code> (все галочки прав можно выключить — боту нужно просто числиться в админах, чтобы видеть подписчиков)."
+            )
+            for aid in admin_ids:
+                try:
+                    await bot.send_message(aid, warn_msg, parse_mode="HTML")
+                except Exception:
+                    pass
         return True, channel_url

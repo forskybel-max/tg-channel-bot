@@ -75,7 +75,7 @@ def build_main_menu_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_sub_gate_kb(channel_url: str, retry_callback: str) -> InlineKeyboardMarkup:
+def build_sub_gate_kb(channel_url: str, retry_callback: str = "sub:check:home") -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if channel_url:
         rows.append(
@@ -90,13 +90,12 @@ def build_sub_gate_kb(channel_url: str, retry_callback: str) -> InlineKeyboardMa
     rows.append(
         [
             InlineKeyboardButton(
-                text="✅ Я подписался — забрать",
+                text="✅ Я подписался — продолжить",
                 callback_data=retry_callback,
                 style=ButtonStyle.SUCCESS,
             )
         ]
     )
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -396,6 +395,7 @@ def build_admin_main_kb(pending_orders: int = 0) -> InlineKeyboardMarkup:
 
 def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     req_sub = "🟢 Вкл" if settings.get("require_sub") == "1" else "🔴 Выкл"
+    users_cnt = "🟢 Вкл" if settings.get("show_users_count", "1") == "1" else "🔴 Выкл"
     paid_sec = "🟢 Виден" if settings.get("show_paid_section") == "1" else "🔴 Скрыт"
     stars_on = "🟢 Вкл" if settings.get("enable_stars") == "1" else "🔴 Выкл"
     manual_on = "🟢 Вкл" if settings.get("enable_manual_pay") == "1" else "🔴 Выкл"
@@ -420,6 +420,15 @@ def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
                     text="🔗 Ссылка на канал",
                     callback_data="adm:set_edit:channel_url",
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"👥 Счетчик участников сверху: {users_cnt}",
+                    callback_data="adm:set_toggle:show_users_count",
+                    style=ButtonStyle.PRIMARY
+                    if settings.get("show_users_count", "1") == "1"
+                    else None,
+                )
             ],
             [
                 InlineKeyboardButton(

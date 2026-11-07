@@ -154,6 +154,7 @@ class Database:
                 "require_sub": "1" if default_channel_id else "0",
                 "channel_id": default_channel_id,
                 "channel_url": default_channel_url,
+                "show_users_count": "1",
                 "show_paid_section": "0",
                 "enable_stars": "1",
                 "enable_manual_pay": "1",
@@ -229,6 +230,11 @@ class Database:
             "SELECT user_id FROM users WHERE is_blocked = FALSE ORDER BY created_at ASC"
         )
         return [int(r["user_id"]) for r in rows]
+
+    async def get_total_users_count(self) -> int:
+        pool = self._require_pool()
+        cnt = await pool.fetchval("SELECT COUNT(*) FROM users")
+        return int(cnt or 0)
 
     async def get_stats(self) -> dict[str, Any]:
         pool = self._require_pool()
