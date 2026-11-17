@@ -18,6 +18,7 @@ ALLOWED_ITEM_FIELDS = {
     "is_paid",
     "price_rub",
     "price_stars",
+    "price_bonus_stars",
     "is_active",
     "sort_order",
 }
@@ -41,7 +42,6 @@ class Database:
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        # statement_cache_size=0 обязателен для корректной работы с Supabase Pooler (PgBouncer :6543)
         self.pool = await asyncpg.create_pool(
             dsn=self.database_url,
             min_size=1,
@@ -58,7 +58,9 @@ class Database:
 
     def _require_pool(self) -> asyncpg.Pool:
         if self.pool is None:
-            raise RuntimeError("Database pool is not initialized. Call await db.connect() first.")
+            raise RuntimeError(
+                "Database pool is not initialized. Call await db.connect() first."
+            )
         return self.pool
 
     async def init_schema(
@@ -78,10 +80,22 @@ class Database:
                     username TEXT DEFAULT '',
                     full_name TEXT DEFAULT '',
                     source_param TEXT DEFAULT '',
+                    referred_by BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                    ref_rewarded BOOLEAN NOT NULL DEFAULT FALSE,
+                    bonus_stars INTEGER NOT NULL DEFAULT 0,
+                    referrals_count INTEGER NOT NULL DEFAULT 0,
+                    paid_orders_count INTEGER NOT NULL DEFAULT 0,
                     is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS referred_by BIGINT REFERENCES users(user_id) ON DELETE SET NULL,
+                    ADD COLUMN IF NOT EXISTS ref_rewarded BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS bonus_stars INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS referrals_count INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS paid_orders_count INTEGER NOT NULL DEFAULT 0;
 
                 CREATE TABLE IF NOT EXISTS categories (
                     id SERIAL PRIMARY KEY,
@@ -104,11 +118,15 @@ class Database:
                     is_paid BOOLEAN NOT NULL DEFAULT FALSE,
                     price_rub INTEGER NOT NULL DEFAULT 0,
                     price_stars INTEGER NOT NULL DEFAULT 0,
+                    price_bonus_stars INTEGER NOT NULL DEFAULT 0,
                     claims_count INTEGER NOT NULL DEFAULT 0,
                     is_active BOOLEAN NOT NULL DEFAULT TRUE,
                     sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                ALTER TABLE items
+                    ADD COLUMN IF NOT EXISTS price_bonus_stars INTEGER NOT NULL DEFAULT 0;
 
                 CREATE TABLE IF NOT EXISTS user_items (
                     user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -134,12 +152,24 @@ class Database:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
+                CREATE TABLE IF NOT EXISTS bonus_transactions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                    amount INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    related_user_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
                 CREATE INDEX IF NOT EXISTS idx_items_category_id ON items(category_id);
                 CREATE INDEX IF NOT EXISTS idx_items_paid_active ON items(is_paid, is_active, sort_order);
+                CREATE INDEX IF NOT EXISTS idx_items_bonus_stars ON items(price_bonus_stars) WHERE is_active = TRUE AND price_bonus_stars > 0;
                 CREATE INDEX IF NOT EXISTS idx_user_items_item_id ON user_items(item_id);
                 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
                 CREATE INDEX IF NOT EXISTS idx_orders_item_id ON orders(item_id);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_bonus_tx_user_id ON bonus_transactions(user_id, created_at DESC);
 
                 ALTER TABLE bot_settings ENABLE ROW LEVEL SECURITY;
                 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -147,6 +177,7 @@ class Database:
                 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
                 ALTER TABLE user_items ENABLE ROW LEVEL SECURITY;
                 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE bonus_transactions ENABLE ROW LEVEL SECURITY;
                 """
             )
 
@@ -157,15 +188,23 @@ class Database:
                 "require_sub": "1" if default_channel_id else "0",
                 "channel_id": default_channel_id,
                 "channel_url": default_channel_url,
-                "show_users_count": "1",
-                "show_paid_section": "0",
+                "show_users_count": "0",
+                "show_paid_section": "1",
+                "show_profile_in_home": "1",
+                "use_custom_emoji": "1",
                 "enable_stars": "1",
-                "enable_manual_pay": "1",
+                "enable_manual_pay": "0",
                 "payment_requisites": "",
                 "payment_instructions": (
                     "Переведите точную сумму по реквизитам ниже, затем нажмите "
                     "<b>«✅ Я оплатил»</b> и отправьте скриншот чека."
                 ),
+                "ref_join_bonus": "1",
+                "ref_first_buy_bonus": "15",
+                "ref_repeat_buy_bonus": "5",
+                "self_first_buy_bonus": "20",
+                "self_repeat_buy_bonus": "5",
+                "bonus_banner_photo_id": "",
             }
             for k, v in defaults.items():
                 await conn.execute(
@@ -174,7 +213,7 @@ class Database:
                     v,
                 )
 
-    # --- Настройки (с in-memory кэшем на 60 сек для мгновенного отклика кнопок) ---
+    # --- Настройки (с in-memory кэшем на 60 сек) ---
 
     async def get_setting(self, key: str, default: str = "") -> str:
         settings = await self.get_all_settings()
@@ -204,19 +243,35 @@ class Database:
         )
         self._settings_cache = None
 
-    # --- Пользователи и статистика ---
+    # --- Пользователи, Профиль и Реферальная система ---
 
     async def upsert_user(
-        self, user_id: int, username: str, full_name: str, source_param: str = ""
+        self,
+        user_id: int,
+        username: str,
+        full_name: str,
+        source_param: str = "",
+        referrer_id: int | None = None,
     ) -> bool:
         pool = self._require_pool()
+        valid_ref: int | None = None
+        if referrer_id and referrer_id != user_id:
+            exists = await pool.fetchval(
+                "SELECT 1 FROM users WHERE user_id = $1", referrer_id
+            )
+            if exists:
+                valid_ref = referrer_id
+
         row = await pool.fetchrow(
             """
-            INSERT INTO users (user_id, username, full_name, source_param, is_blocked, last_active_at)
-            VALUES ($1, $2, $3, $4, FALSE, NOW())
+            INSERT INTO users (
+                user_id, username, full_name, source_param, referred_by, is_blocked, last_active_at
+            )
+            VALUES ($1, $2, $3, $4, $5, FALSE, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 username = EXCLUDED.username,
                 full_name = EXCLUDED.full_name,
+                referred_by = COALESCE(users.referred_by, EXCLUDED.referred_by),
                 is_blocked = FALSE,
                 last_active_at = NOW()
             RETURNING (xmax = 0) AS is_new
@@ -225,8 +280,259 @@ class Database:
             username or "",
             full_name or "",
             source_param or "",
+            valid_ref,
         )
         return bool(row["is_new"]) if row else False
+
+    async def get_user(self, user_id: int) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        row = await pool.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        return dict(row) if row else None
+
+    async def process_referral_join(self, user_id: int) -> dict[str, Any] | None:
+        """
+        Начисляет бонус рефереру после того, как приглашенный друг прошел подписку на канал.
+        Срабатывает строго 1 раз для каждого нового реферала.
+        """
+        pool = self._require_pool()
+        settings = await self.get_all_settings()
+        try:
+            join_bonus = max(0, int(settings.get("ref_join_bonus", "1") or "1"))
+        except ValueError:
+            join_bonus = 1
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                u = await conn.fetchrow(
+                    """
+                    SELECT user_id, username, full_name, referred_by, ref_rewarded
+                    FROM users
+                    WHERE user_id = $1
+                    FOR UPDATE
+                    """,
+                    user_id,
+                )
+                if not u or u["ref_rewarded"] or not u["referred_by"]:
+                    return None
+
+                referrer_id = int(u["referred_by"])
+                if referrer_id == user_id:
+                    return None
+
+                await conn.execute(
+                    "UPDATE users SET ref_rewarded = TRUE WHERE user_id = $1",
+                    user_id,
+                )
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET bonus_stars = bonus_stars + $2,
+                        referrals_count = referrals_count + 1
+                    WHERE user_id = $1
+                    """,
+                    referrer_id,
+                    join_bonus,
+                )
+                if join_bonus > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO bonus_transactions (user_id, amount, reason, related_user_id)
+                        VALUES ($1, $2, 'ref_join', $3)
+                        """,
+                        referrer_id,
+                        join_bonus,
+                        user_id,
+                    )
+                return {
+                    "referrer_id": referrer_id,
+                    "bonus": join_bonus,
+                    "friend_id": user_id,
+                    "friend_username": u["username"] or "",
+                    "friend_name": u["full_name"] or "",
+                }
+
+    async def process_purchase_bonuses(self, buyer_id: int) -> dict[str, Any]:
+        """
+        Начисляет бонусные звёзды при покупке платного товара:
+        1) Рефереру (повышенный бонус за 1-ю покупку друга и бонус за следующие).
+        2) Самому покупателю (кэшбэк за 1-ю и следующие покупки) + другу при повторной покупке.
+        """
+        pool = self._require_pool()
+        settings = await self.get_all_settings()
+
+        def _int_set(key: str, default: int) -> int:
+            try:
+                return max(0, int(settings.get(key, str(default)) or str(default)))
+            except ValueError:
+                return default
+
+        ref_first = _int_set("ref_first_buy_bonus", 15)
+        ref_repeat = _int_set("ref_repeat_buy_bonus", 5)
+        self_first = _int_set("self_first_buy_bonus", 20)
+        self_repeat = _int_set("self_repeat_buy_bonus", 5)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                u = await conn.fetchrow(
+                    """
+                    UPDATE users
+                    SET paid_orders_count = paid_orders_count + 1
+                    WHERE user_id = $1
+                    RETURNING paid_orders_count, referred_by, username, full_name
+                    """,
+                    buyer_id,
+                )
+                if not u:
+                    return {}
+
+                orders_cnt = int(u["paid_orders_count"])
+                is_first = orders_cnt == 1
+                buyer_bonus = self_first if is_first else self_repeat
+
+                if buyer_bonus > 0:
+                    await conn.execute(
+                        "UPDATE users SET bonus_stars = bonus_stars + $2 WHERE user_id = $1",
+                        buyer_id,
+                        buyer_bonus,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO bonus_transactions (user_id, amount, reason, related_user_id)
+                        VALUES ($1, $2, $3, $1)
+                        """,
+                        buyer_id,
+                        buyer_bonus,
+                        "self_first_buy" if is_first else "self_repeat_buy",
+                    )
+
+                referrer_id = int(u["referred_by"]) if u["referred_by"] else None
+                ref_bonus = 0
+                if referrer_id and referrer_id != buyer_id:
+                    ref_bonus = ref_first if is_first else ref_repeat
+                    if ref_bonus > 0:
+                        await conn.execute(
+                            "UPDATE users SET bonus_stars = bonus_stars + $2 WHERE user_id = $1",
+                            referrer_id,
+                            ref_bonus,
+                        )
+                        await conn.execute(
+                            """
+                            INSERT INTO bonus_transactions (user_id, amount, reason, related_user_id)
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            referrer_id,
+                            ref_bonus,
+                            "ref_first_buy" if is_first else "ref_repeat_buy",
+                            buyer_id,
+                        )
+
+                return {
+                    "is_first": is_first,
+                    "buyer_bonus": buyer_bonus,
+                    "referrer_id": referrer_id,
+                    "ref_bonus": ref_bonus,
+                    "buyer_username": u["username"] or "",
+                    "buyer_name": u["full_name"] or "",
+                }
+
+    async def spend_bonus_for_item(
+        self, user_id: int, item_id: int
+    ) -> tuple[bool, str]:
+        """Покупка товара за накопленные бонусные звёзды."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                already = await conn.fetchval(
+                    "SELECT 1 FROM user_items WHERE user_id = $1 AND item_id = $2",
+                    user_id,
+                    item_id,
+                )
+                if already:
+                    return False, "already_owned"
+
+                item = await conn.fetchrow(
+                    "SELECT id, title, price_bonus_stars, is_active FROM items WHERE id = $1",
+                    item_id,
+                )
+                if not item or not item["is_active"]:
+                    return False, "unavailable"
+
+                cost = int(item["price_bonus_stars"] or 0)
+                if cost <= 0:
+                    return False, "not_for_bonus"
+
+                u = await conn.fetchrow(
+                    "SELECT bonus_stars FROM users WHERE user_id = $1 FOR UPDATE",
+                    user_id,
+                )
+                balance = int(u["bonus_stars"]) if u else 0
+                if balance < cost:
+                    return False, f"insufficient:{balance}:{cost}"
+
+                await conn.execute(
+                    "UPDATE users SET bonus_stars = bonus_stars - $2 WHERE user_id = $1",
+                    user_id,
+                    cost,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO bonus_transactions (user_id, amount, reason, related_user_id)
+                    VALUES ($1, $2, 'spend_bonus', NULL)
+                    """,
+                    user_id,
+                    -cost,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO user_items (user_id, item_id, access_type)
+                    VALUES ($1, $2, 'bonus')
+                    ON CONFLICT (user_id, item_id) DO NOTHING
+                    """,
+                    user_id,
+                    item_id,
+                )
+                await conn.execute(
+                    "UPDATE items SET claims_count = claims_count + 1 WHERE id = $1",
+                    item_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO orders (
+                        user_id, item_id, payment_method, amount, currency, status, receipt_note
+                    )
+                    VALUES ($1, $2, 'bonus', $3, 'BONUS', 'paid', 'Paid with referral bonus stars')
+                    """,
+                    user_id,
+                    item_id,
+                    cost,
+                )
+                return True, "ok"
+
+    async def adjust_user_bonus(self, user_id: int, delta: int) -> int | None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                new_bal = await conn.fetchval(
+                    """
+                    UPDATE users
+                    SET bonus_stars = GREATEST(0, bonus_stars + $2)
+                    WHERE user_id = $1
+                    RETURNING bonus_stars
+                    """,
+                    user_id,
+                    int(delta),
+                )
+                if new_bal is None:
+                    return None
+                await conn.execute(
+                    """
+                    INSERT INTO bonus_transactions (user_id, amount, reason)
+                    VALUES ($1, $2, 'admin_adjust')
+                    """,
+                    user_id,
+                    int(delta),
+                )
+                return int(new_bal)
 
     async def set_user_blocked(self, user_id: int, blocked: bool = True) -> None:
         pool = self._require_pool()
@@ -251,7 +557,10 @@ class Database:
         async with pool.acquire() as conn:
             total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
             active_users = (
-                await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_blocked = FALSE") or 0
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM users WHERE is_blocked = FALSE"
+                )
+                or 0
             )
             new_24h = (
                 await conn.fetchval(
@@ -266,17 +575,33 @@ class Database:
                 or 0
             )
             free_items = (
-                await conn.fetchval("SELECT COUNT(*) FROM items WHERE is_paid = FALSE") or 0
+                await conn.fetchval("SELECT COUNT(*) FROM items WHERE is_paid = FALSE")
+                or 0
             )
             paid_items = (
-                await conn.fetchval("SELECT COUNT(*) FROM items WHERE is_paid = TRUE") or 0
+                await conn.fetchval("SELECT COUNT(*) FROM items WHERE is_paid = TRUE")
+                or 0
             )
             total_claims = await conn.fetchval("SELECT COUNT(*) FROM user_items") or 0
             paid_orders = (
-                await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'paid'") or 0
+                await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'paid'")
+                or 0
             )
             pending_orders = (
-                await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'pending'") or 0
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM orders WHERE status = 'pending'"
+                )
+                or 0
+            )
+            total_referrals = (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM users WHERE ref_rewarded = TRUE"
+                )
+                or 0
+            )
+            total_bonus_circulation = (
+                await conn.fetchval("SELECT COALESCE(SUM(bonus_stars), 0) FROM users")
+                or 0
             )
             top_items = await conn.fetch(
                 """
@@ -296,6 +621,8 @@ class Database:
                 "total_claims": int(total_claims),
                 "paid_orders": int(paid_orders),
                 "pending_orders": int(pending_orders),
+                "total_referrals": int(total_referrals),
+                "total_bonus_circulation": int(total_bonus_circulation),
                 "top_items": [dict(r) for r in top_items],
             }
 
@@ -362,7 +689,7 @@ class Database:
         pool = self._require_pool()
         await pool.execute("DELETE FROM categories WHERE id = $1", cat_id)
 
-    # --- Материалы (Гайды и Товары) ---
+    # --- Материалы (Гайды и Товары Каталога) ---
 
     async def create_item(
         self,
@@ -377,6 +704,7 @@ class Database:
         is_paid: bool = False,
         price_rub: int = 0,
         price_stars: int = 0,
+        price_bonus_stars: int = 0,
     ) -> int:
         pool = self._require_pool()
         item_id = await pool.fetchval(
@@ -384,9 +712,9 @@ class Database:
             INSERT INTO items (
                 category_id, title, description, cover_photo_id,
                 content_text, file_id, file_type, copy_snippet,
-                is_paid, price_rub, price_stars, is_active
+                is_paid, price_rub, price_stars, price_bonus_stars, is_active
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE)
             RETURNING id
             """,
             category_id,
@@ -400,6 +728,7 @@ class Database:
             is_paid,
             max(0, int(price_rub)),
             max(0, int(price_stars)),
+            max(0, int(price_bonus_stars)),
         )
         return int(item_id)
 
@@ -461,6 +790,17 @@ class Database:
                 """,
                 is_paid,
             )
+        return [dict(r) for r in rows]
+
+    async def get_bonus_exchange_items(self) -> list[dict[str, Any]]:
+        pool = self._require_pool()
+        rows = await pool.fetch(
+            """
+            SELECT * FROM items
+            WHERE is_active = TRUE AND price_bonus_stars > 0
+            ORDER BY price_bonus_stars ASC, sort_order ASC, id DESC
+            """
+        )
         return [dict(r) for r in rows]
 
     async def get_all_items_admin(self) -> list[dict[str, Any]]:

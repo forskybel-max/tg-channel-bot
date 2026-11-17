@@ -18,10 +18,12 @@ from aiogram.types import (
 
 from app.config import Config
 from app.database import Database
+from app.handlers.payments import notify_purchase_bonuses
 from app.handlers.user import render_screen
 from app.keyboards import (
     build_admin_item_manage_kb,
     build_admin_main_kb,
+    build_admin_ref_settings_kb,
     build_admin_settings_kb,
     build_cancel_kb,
     build_order_review_kb,
@@ -49,6 +51,10 @@ class AdminStates(StatesGroup):
     # Настройки
     edit_setting_text = State()
     edit_setting_photo = State()
+
+    # Управление бонусами и эмодзи
+    give_bonus = State()
+    inspect_emoji = State()
 
     # Рассылка
     broadcast_msg = State()
@@ -84,7 +90,6 @@ def setup_admin_router(config: Config, db: Database) -> Router:
     router = Router(name="admin")
     cached_bot_username = ""
 
-    # Глобальный фильтр прав администратора на весь роутер
     router.message.filter(F.from_user.id.in_(config.admin_ids))
     router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
 
@@ -93,8 +98,10 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         text = (
             "⚙️ <b>Панель управления ботом</b>\n\n"
             f"👥 Пользователей: <b>{stats['total_users']}</b> (за 24ч: +{stats['new_24h']})\n"
+            f"🤝 Приглашено по рефке: <b>{stats['total_referrals']}</b>\n"
+            f"⭐️ Бонусов на балансах: <b>{stats['total_bonus_circulation']} ⭐️</b>\n"
             f"📘 Бесплатных гайдов: <b>{stats['free_items']}</b>\n"
-            f"💎 Платных продуктов: <b>{stats['paid_items']}</b>\n"
+            f"🛒 Товаров в каталоге: <b>{stats['paid_items']}</b>\n"
             f"📥 Выдано материалов: <b>{stats['total_claims']}</b>\n"
             f"🧾 Ожидают проверки чеков: <b>{stats['pending_orders']}</b>"
         )
@@ -120,9 +127,13 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         bot_username = cached_bot_username
         deep_link = f"https://t.me/{bot_username}?start=item_{item['id']}"
 
-        kind_str = "💎 Платный товар" if item.get("is_paid") else "📘 Бесплатный гайд"
+        kind_str = (
+            "🛒 Товар в Каталоге" if item.get("is_paid") else "📘 Бесплатный гайд"
+        )
         status_str = "🟢 Опубликован" if item.get("is_active") else "🔴 Скрыт"
-        cat_str = html.escape(item.get("category_title") or "Без папки (в корне раздела)")
+        cat_str = html.escape(
+            item.get("category_title") or "Без папки (в корне раздела)"
+        )
         file_str = f"✅ {item['file_type']}" if item.get("file_id") else "нет"
         cover_str = "✅ есть" if item.get("cover_photo_id") else "нет"
         copy_str = (
@@ -133,10 +144,12 @@ def setup_admin_router(config: Config, db: Database) -> Router:
 
         text = (
             f"🛠 <b>Материал #{item['id']}: {html.escape(item['title'])}</b>\n\n"
-            f"• <b>Тип:</b> {kind_str}\n"
+            f"• <b>Раздел:</b> {kind_str}\n"
             f"• <b>Статус:</b> {status_str}\n"
             f"• <b>Категория:</b> {cat_str}\n"
-            f"• <b>Цена:</b> {item.get('price_rub', 0)} ₽ / ⭐️ {item.get('price_stars', 0)} Stars\n"
+            f"• <b>Цена TG Stars:</b> ⭐️ {item.get('price_stars', 0)} XTR\n"
+            f"• <b>Цена за бонусы (Обмен):</b> 🎁 {item.get('price_bonus_stars', 0)} ⭐️\n"
+            f"• <b>Цена в рублях:</b> {item.get('price_rub', 0)} ₽\n"
             f"• <b>Файл внутри:</b> {file_str} | <b>Обложка:</b> {cover_str}\n"
             f"• <b>Кнопка-копирка:</b> {copy_str}\n"
             f"• <b>Получили / купили:</b> {item.get('claims_count', 0)} чел.\n\n"
@@ -182,6 +195,8 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             f"🟢 Активных (для рассылки): <b>{st['active_users']}</b>\n"
             f"🆕 Новых за 24 часа: <b>+{st['new_24h']}</b>\n"
             f"📅 Новых за 7 дней: <b>+{st['new_7d']}</b>\n\n"
+            f"🤝 Приглашено рефералов: <b>{st['total_referrals']}</b>\n"
+            f"⭐️ Бонусных звёзд у юзеров: <b>{st['total_bonus_circulation']} ⭐️</b>\n"
             f"📥 Всего выдано материалов: <b>{st['total_claims']}</b>\n"
             f"💰 Оплаченных заказов: <b>{st['paid_orders']}</b>\n\n"
             f"🏆 <b>Топ материалов по скачиваниям:</b>\n{top_block}"
@@ -208,14 +223,14 @@ def setup_admin_router(config: Config, db: Database) -> Router:
                     style=ButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
-                    text="➕ Папка в «Продукты»",
+                    text="➕ Папка в «Каталог»",
                     callback_data="adm:cat_add:shop",
                     style=ButtonStyle.SUCCESS,
                 ),
             ]
         ]
         for c in cats:
-            sec_badge = "📚" if c["section"] == "guides" else "🔥"
+            sec_badge = "📚 Гайды:" if c["section"] == "guides" else "🛒 Каталог:"
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -232,9 +247,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         rows.append([InlineKeyboardButton(text="⬅️ В админку", callback_data="adm:menu")])
 
         text = (
-            "📁 <b>Категории (папки каталога)</b>\n\n"
-            "Категории необязательны: материалы без категории отображаются прямо в корне раздела.\n"
-            "При удалении папки сами материалы не удаляются, а просто переходят в корень раздела."
+            "📁 <b>Категории для разделов «Гайды» и «Каталог»</b>\n\n"
+            "Вы можете создавать тематические папки отдельно для бесплатных гайдов и для платного каталога.\n"
+            "Материалы без категории показываются сразу при входе в раздел."
         )
         await render_screen(event, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -254,10 +269,10 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await call.answer()
         await state.set_state(AdminStates.new_cat_title)
         await state.update_data(cat_section=section)
-        sec_name = "📚 Бесплатные гайды" if section == "guides" else "🔥 Продукты"
+        sec_name = "📚 Гайды" if section == "guides" else "🛒 Каталог"
         await render_screen(
             call,
-            f"📁 Введите название новой папки для раздела <b>«{sec_name}»</b>:",
+            f"📁 Введите название новой категории для раздела <b>«{sec_name}»</b>:",
             build_cancel_kb("adm:cats"),
         )
 
@@ -278,7 +293,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         raw_id = (call.data or "").split(":")[-1]
         if raw_id.isdigit():
             await db.delete_category(int(raw_id))
-            await call.answer("Папка удалена")
+            await call.answer("Категория удалена")
         await render_categories_admin(call)
 
     # ==========================================
@@ -294,19 +309,24 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         rows: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить новый материал",
+                    text="➕ Добавить гайд / товар",
                     callback_data="adm:add_item",
                     style=ButtonStyle.SUCCESS,
                 )
             ]
         ]
         for it in items[:40]:
-            ic = "💎" if it["is_paid"] else "📘"
+            ic = "🛒" if it["is_paid"] else "📘"
             st = "🟢" if it["is_active"] else "🔴"
+            bonus_tag = (
+                f" [🎁{it['price_bonus_stars']}⭐️]"
+                if int(it.get("price_bonus_stars") or 0) > 0
+                else ""
+            )
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"{st} {ic} #{it['id']} {it['title']} ({it['claims_count']})"[:64],
+                        text=f"{st} {ic} #{it['id']} {it['title']}{bonus_tag} ({it['claims_count']})"[:64],
                         callback_data=f"adm:item:{it['id']}",
                     )
                 ]
@@ -314,8 +334,8 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         rows.append([InlineKeyboardButton(text="⬅️ В админку", callback_data="adm:menu")])
 
         text = (
-            f"📚 <b>Все материалы ({len(items)})</b>\n\n"
-            "Нажмите на материал для настройки, получения ссылки в пост или смены цены:"
+            f"📚 <b>Все материалы и товары ({len(items)})</b>\n\n"
+            "Нажмите на позицию для редактирования цены в TG Stars, цены в бонусных звёздах или получения ссылки в пост:"
         )
         await render_screen(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -327,14 +347,14 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="📘 Бесплатный гайд / Инфо",
+                        text="📘 В раздел «Гайды» (Бесплатно)",
                         callback_data="adm:new_type:free",
                         style=ButtonStyle.SUCCESS,
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="💎 Платный товар / Доступ",
+                        text="🛒 В раздел «Каталог» (За TG Stars / Бонусы)",
                         callback_data="adm:new_type:paid",
                         style=ButtonStyle.PRIMARY,
                     )
@@ -350,7 +370,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         )
         await render_screen(
             call,
-            "➕ <b>Новый материал</b>\n\nКакой формат создаём? (Позже тип можно переключить в 1 клик)",
+            "➕ <b>Добавление материала</b>\n\nВ какой раздел добавляем позицию?",
             kb,
         )
 
@@ -375,9 +395,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await state.update_data(title=title)
         await state.set_state(AdminStates.new_description)
         await message.answer(
-            "📝 <b>Шаг 2 из 3 — Описание на витрине</b>\n\n"
-            "Отправьте описание карточки, которое увидит человек до открытия/покупки "
-            "(поддерживается форматирование Telegram, либо отправьте <code>-</code>, чтобы пропустить):",
+            "📝 <b>Шаг 2 из 3 — Описание карточки</b>\n\n"
+            "Отправьте описание для витрины (поддерживаются любые премиум-эмодзи и форматирование Telegram, "
+            "либо отправьте <code>-</code>, чтобы пропустить):",
             parse_mode="HTML",
             reply_markup=build_cancel_kb("adm:menu"),
         )
@@ -389,11 +409,11 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await state.update_data(description=desc)
         await state.set_state(AdminStates.new_content)
         await message.answer(
-            "🎁 <b>Шаг 3 из 3 — Начинка материала</b>\n\n"
-            "Отправьте то, что бот выдаст пользователю:\n"
-            "• PDF / ZIP / документ с подписью или без\n"
+            "🎁 <b>Шаг 3 из 3 — Выдаваемый материал</b>\n\n"
+            "Отправьте то, что бот выдаст после открытия или покупки:\n"
+            "• PDF / ZIP / документ\n"
             "• Видео или фото\n"
-            "• Или просто текст со ссылками (например, на Notion / закрытый чат / статью):",
+            "• Или текст со ссылками / ключом / доступом в закрытый чат:",
             parse_mode="HTML",
             reply_markup=build_cancel_kb("adm:menu"),
         )
@@ -405,7 +425,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         content_text = _extract_html(message)
         file_id, file_type = _extract_media(message)
         if not content_text and not file_id:
-            await message.answer("Отправьте текст, ссылку или прикрепите файл/видео/фото.")
+            await message.answer(
+                "Отправьте текст, ссылку или прикрепите файл/видео/фото."
+            )
             return
 
         data = await state.get_data()
@@ -416,12 +438,11 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         if data.get("is_paid"):
             await state.set_state(AdminStates.new_prices)
             await message.answer(
-                "💳 <b>Укажите стоимость товара</b>\n\n"
-                "Отправьте две цифры через пробел: <code>Цена_в_рублях Цена_в_Stars</code>\n"
-                "Например: <code>990 500</code>\n"
-                "• Если только рубли: <code>990 0</code>\n"
-                "• Если только Stars: <code>0 500</code>\n"
-                "• Если пока «Скоро в продаже»: <code>0 0</code>",
+                "⭐️ <b>Укажите цену в Telegram Stars и (опционально) в бонусных звёздах</b>\n\n"
+                "Примеры ввода:\n"
+                "• <code>100</code> — цена 100 TG Stars\n"
+                "• <code>100 30</code> — 100 TG Stars ИЛИ 30 бонусных звёзд (появится и в «Обмене бонусов»)\n"
+                "• <code>0 25</code> — товар ТОЛЬКО за 25 бонусных звёзд рефералки",
                 parse_mode="HTML",
                 reply_markup=build_cancel_kb("adm:menu"),
             )
@@ -443,12 +464,16 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         message: Message, state: FSMContext, bot: Bot
     ) -> None:
         parts = (message.text or "").strip().split()
-        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+        if not parts or not all(p.isdigit() for p in parts) or len(parts) > 3:
             await message.answer(
-                "Введите два целых числа через пробел, например: <code>990 500</code> или <code>0 0</code>",
+                "Введите одну или две цифры через пробел: <code>Цена_TG_Stars</code> или <code>Цена_TG_Stars Цена_Бонусами</code> (например: <code>100</code> или <code>100 30</code>).",
                 parse_mode="HTML",
             )
             return
+
+        price_stars = int(parts[0])
+        price_bonus = int(parts[1]) if len(parts) >= 2 else 0
+        price_rub = int(parts[2]) if len(parts) == 3 else 0
 
         data = await state.get_data()
         await state.clear()
@@ -459,8 +484,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             file_id=data.get("file_id", ""),
             file_type=data.get("file_type", ""),
             is_paid=True,
-            price_rub=int(parts[0]),
-            price_stars=int(parts[1]),
+            price_stars=price_stars,
+            price_bonus_stars=price_bonus,
+            price_rub=price_rub,
         )
         await show_admin_item(message, bot, item_id)
 
@@ -514,9 +540,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await db.update_item_field(item_id, "is_paid", new_val)
         await db.update_item_field(item_id, "category_id", None)
         await call.answer(
-            "Переведено в Платные товары (не забудьте указать цену!)"
-            if new_val
-            else "Переведено в Бесплатные гайды!"
+            "Перенесено в Каталог!" if new_val else "Перенесено в Бесплатные гайды!"
         )
         await show_admin_item(call, bot, item_id)
 
@@ -532,8 +556,12 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             "title": "Введите новое название материала:",
             "description": "Отправьте новое описание карточки (или <code>-</code>, чтобы очистить):",
             "content_text": "Отправьте новый внутренний текст/ссылку материала (или <code>-</code>, чтобы очистить):",
-            "price_rub": "Введите цену в рублях (целое число, например <code>990</code> или <code>0</code>):",
-            "price_stars": "Введите цену в Telegram Stars (целое число, например <code>500</code> или <code>0</code>):",
+            "price_stars": "⭐️ Введите цену в <b>Telegram Stars</b> (целое число, например <code>150</code> или <code>0</code>):",
+            "price_bonus_stars": (
+                "🎁 Введите цену в <b>бонусных звёздах рефералки</b> (например <code>25</code>; "
+                "если больше 0 — товар также появится в разделе «Обмен бонусов», <code>0</code> — отключить):"
+            ),
+            "price_rub": "💳 Введите цену в рублях (целое число, например <code>990</code> или <code>0</code>):",
             "copy_snippet": (
                 "Отправьте текст (до 256 симв.) для синей кнопки быстрого копирования под материалом "
                 "(например, готовый промпт или промокод; отправьте <code>-</code>, чтобы убрать кнопку):"
@@ -556,10 +584,12 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         item_id = int(data["edit_item_id"])
         field = data["edit_field"]
 
-        if field in ("price_rub", "price_stars"):
+        if field in ("price_rub", "price_stars", "price_bonus_stars"):
             raw_num = (message.text or "").strip()
             if not raw_num.isdigit():
-                await message.answer("Введите целое неотрицательное число (например, 0 или 990).")
+                await message.answer(
+                    "Введите целое неотрицательное число (например, 0 или 100)."
+                )
                 return
             val: Any = int(raw_num)
         elif field in ("description", "content_text"):
@@ -604,7 +634,10 @@ def setup_admin_router(config: Config, db: Database) -> Router:
 
         file_id, file_type = _extract_media(message)
         if not file_id:
-            await message.answer("Прикрепите документ, видео, фото или отправьте <code>-</code>.", parse_mode="HTML")
+            await message.answer(
+                "Прикрепите документ, видео, фото или отправьте <code>-</code>.",
+                parse_mode="HTML",
+            )
             return
         await state.clear()
         await db.update_item_field(item_id, "file_id", file_id)
@@ -636,7 +669,10 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             await show_admin_item(message, bot, item_id)
             return
         if not message.photo:
-            await message.answer("Отправьте изображение именно как Фото (не файлом) или <code>-</code>.", parse_mode="HTML")
+            await message.answer(
+                "Отправьте изображение именно как Фото (не файлом) или <code>-</code>.",
+                parse_mode="HTML",
+            )
             return
         await state.clear()
         await db.update_item_field(item_id, "cover_photo_id", message.photo[-1].file_id)
@@ -675,7 +711,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await call.answer()
         await render_screen(
             call,
-            "📁 Выберите папку для размещения материала:",
+            "📁 Выберите категорию для размещения позиции:",
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
@@ -684,7 +720,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         parts = (call.data or "").split(":")
         item_id = int(parts[2])
         cat_id = int(parts[3])
-        await db.update_item_field(item_id, "category_id", cat_id if cat_id > 0 else None)
+        await db.update_item_field(
+            item_id, "category_id", cat_id if cat_id > 0 else None
+        )
         await call.answer("Категория обновлена")
         await show_admin_item(call, bot, item_id)
 
@@ -717,6 +755,128 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         await db.delete_item(item_id)
         await call.answer("Материал удален")
         await cb_items_list(call, state)
+
+    # ==========================================
+    # РЕФЕРАЛКА, БОНУСЫ И ID ЭМОДЗИ
+    # ==========================================
+
+    async def show_ref_settings_screen(event: Message | CallbackQuery) -> None:
+        s = await db.get_all_settings()
+        st = await db.get_stats()
+        banner_state = "установлен ✅" if s.get("bonus_banner_photo_id") else "нет"
+        text = (
+            "⭐️ <b>Управление реферальной и бонусной системой</b>\n\n"
+            f"🤝 Всего приглашено по реф. ссылкам: <b>{st['total_referrals']} чел.</b>\n"
+            f"🪙 Суммарный баланс бонусов у юзеров: <b>{st['total_bonus_circulation']} ⭐️</b>\n"
+            f"🖼 Баннер раздела «Бонусная система»: <b>{banner_state}</b>\n\n"
+            "Нажмите на любую награду ниже, чтобы изменить количество начисляемых бонусных звёзд:"
+        )
+        await render_screen(event, text, build_admin_ref_settings_kb(s))
+
+    @router.callback_query(F.data == "adm:ref_settings")
+    async def cb_ref_settings(call: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await call.answer()
+        await show_ref_settings_screen(call)
+
+    @router.callback_query(F.data == "adm:bonus_give")
+    async def cb_bonus_give(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        await state.set_state(AdminStates.give_bonus)
+        await render_screen(
+            call,
+            "➕ <b>Начисление / списание бонусных звёзд</b>\n\n"
+            "Отправьте через пробел: <code>Telegram_ID Количество</code>\n"
+            "• Начислить 50 звёзд: <code>6994033812 50</code>\n"
+            "• Списать 20 звёзд: <code>6994033812 -20</code>",
+            build_cancel_kb("adm:ref_settings"),
+        )
+
+    @router.message(AdminStates.give_bonus)
+    async def process_bonus_give(
+        message: Message, state: FSMContext, bot: Bot
+    ) -> None:
+        parts = (message.text or "").strip().split()
+        if (
+            len(parts) != 2
+            or not parts[0].isdigit()
+            or not parts[1].lstrip("-").isdigit()
+        ):
+            await message.answer(
+                "Формат: <code>ID Число</code>, например: <code>6994033812 50</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        target_uid = int(parts[0])
+        delta = int(parts[1])
+        new_bal = await db.adjust_user_bonus(target_uid, delta)
+        if new_bal is None:
+            await message.answer(
+                f"Пользователь с ID <code>{target_uid}</code> ещё не запускал бота.",
+                parse_mode="HTML",
+            )
+            return
+
+        await state.clear()
+        await message.answer(
+            f"✅ Готово! Новый бонусный баланс пользователя <code>{target_uid}</code>: <b>{new_bal} ⭐️</b>",
+            parse_mode="HTML",
+        )
+        if delta > 0:
+            try:
+                await bot.send_message(
+                    chat_id=target_uid,
+                    text=f"🎁 Администратор начислил вам <b>+{delta} ⭐️</b> бонусных звёзд! Ваш баланс: <b>{new_bal} ⭐️</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        await show_ref_settings_screen(message)
+
+    @router.callback_query(F.data == "adm:emoji_id")
+    async def cb_emoji_id_start(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        await state.set_state(AdminStates.inspect_emoji)
+        await render_screen(
+            call,
+            "✨ <b>Инспектор кастомных анимированных эмодзи</b>\n\n"
+            "Отправьте сюда любое сообщение с одним или несколькими платными/анимированными эмодзи Telegram — "
+            "я вытащу их точные <code>emoji_id</code> и готовый HTML-код <code>&lt;tg-emoji&gt;</code>!",
+            build_cancel_kb("adm:menu"),
+        )
+
+    @router.message(AdminStates.inspect_emoji)
+    async def process_inspect_emoji(message: Message, state: FSMContext) -> None:
+        entities = (message.entities or []) + (message.caption_entities or [])
+        ce_list = [e for e in entities if e.type == "custom_emoji" and e.custom_emoji_id]
+        if not ce_list:
+            await message.answer(
+                "В сообщении не найдено кастомных эмодзи Telegram Premium. Отправьте именно анимированный кастомный эмодзи!"
+            )
+            return
+
+        await state.clear()
+        lines = ["✨ <b>Найденные кастомные эмодзи:</b>\n"]
+        raw_text = message.text or message.caption or ""
+        for idx, ent in enumerate(ce_list, start=1):
+            cid = ent.custom_emoji_id
+            lines.append(
+                f"{idx}. ID: <code>{cid}</code>\n"
+                f"HTML: <code>&lt;tg-emoji emoji-id=\"{cid}\"&gt;⭐️&lt;/tg-emoji&gt;</code>"
+            )
+        lines.append(
+            "\n<i>💡 Совет: когда вы просто пишете текст с кастомными эмодзи при редактировании описания товара или приветствия в боте — бот автоматически сохраняет их анимацию!</i>"
+        )
+        await message.answer(
+            "\n\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ В админку", callback_data="adm:menu")]
+                ]
+            ),
+        )
 
     # ==========================================
     # ЗАЯВКИ НА ОПЛАТУ (ПОЛУАВТОМАТ)
@@ -789,11 +949,19 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         ftype = order.get("receipt_file_type", "")
         if ftype == "photo" and fid:
             await bot.send_photo(
-                call.message.chat.id, fid, caption=caption[:1024], parse_mode="HTML", reply_markup=kb
+                call.message.chat.id,
+                fid,
+                caption=caption[:1024],
+                parse_mode="HTML",
+                reply_markup=kb,
             )
         elif ftype == "document" and fid:
             await bot.send_document(
-                call.message.chat.id, fid, caption=caption[:1024], parse_mode="HTML", reply_markup=kb
+                call.message.chat.id,
+                fid,
+                caption=caption[:1024],
+                parse_mode="HTML",
+                reply_markup=kb,
             )
         else:
             await render_screen(call, caption, kb)
@@ -813,7 +981,8 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             except Exception:
                 pass
             await call.message.answer(
-                f"✅ Заказ <b>#{order_id}</b> подтвержден, доступ выдан!", parse_mode="HTML"
+                f"✅ Заказ <b>#{order_id}</b> подтвержден, доступ выдан!",
+                parse_mode="HTML",
             )
 
         item = await db.get_item(resolved["item_id"])
@@ -826,7 +995,13 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             if item:
                 await deliver_item_content(bot, resolved["user_id"], item)
         except Exception as exc:
-            logger.warning("Не удалось отправить купленный товар юзеру %s: %s", resolved["user_id"], exc)
+            logger.warning(
+                "Не удалось отправить купленный товар юзеру %s: %s",
+                resolved["user_id"],
+                exc,
+            )
+
+        await notify_purchase_bonuses(bot, db, int(resolved["user_id"]))
 
     @router.callback_query(F.data.startswith("adm:ord_no:"))
     async def cb_order_reject(call: CallbackQuery, bot: Bot) -> None:
@@ -851,7 +1026,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
                 chat_id=resolved["user_id"],
                 text=(
                     f"⚠️ <b>Заявка на оплату #{order_id} не была подтверждена.</b>\n"
-                    "Если произошла ошибка, пожалуйста, напишите через кнопку «💬 Связь с автором»."
+                    "Если произошла ошибка, пожалуйста, напишите через кнопку «💬 Поддержка»."
                 ),
                 parse_mode="HTML",
             )
@@ -867,15 +1042,15 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         ch_id = html.escape(s.get("channel_id") or "не задан")
         ch_url = html.escape(s.get("channel_url") or "не задана")
         req = html.escape(s.get("payment_requisites") or "не заданы")
-        w_photo = "установлена ✅" if s.get("welcome_photo_id") else "нет"
+        w_photo = "установлен ✅" if s.get("welcome_photo_id") else "нет"
 
         text = (
-            "⚙️ <b>Настройки бота, подписки и оплат</b>\n\n"
-            f"• <b>Канал для проверки подписки:</b> <code>{ch_id}</code>\n"
+            "⚙️ <b>Настройки бота, подписки и витрины</b>\n\n"
+            f"• <b>Канал подписки:</b> <code>{ch_id}</code>\n"
             f"• <b>Ссылка на канал:</b> {ch_url}\n"
             f"• <b>Реквизиты полуавтомата:</b> <code>{req}</code>\n"
-            f"• <b>Обложка /start:</b> {w_photo}\n\n"
-            "<i>💡 Чтобы проверка подписки работала, добавьте этого бота в администраторы вашего канала (достаточно любых минимальных прав).</i>"
+            f"• <b>Баннер /start:</b> {w_photo}\n\n"
+            "<i>💡 При отправке текстов приветствия или описания со своего аккаунта можете использовать любые кастомные эмодзи — бот сохранит их анимацию.</i>"
         )
         await render_screen(event, text, build_admin_settings_kb(s))
 
@@ -897,6 +1072,15 @@ def setup_admin_router(config: Config, db: Database) -> Router:
     @router.callback_query(F.data.startswith("adm:set_edit:"))
     async def cb_set_edit(call: CallbackQuery, state: FSMContext) -> None:
         key = (call.data or "").split(":")[-1]
+        is_ref_key = key in (
+            "ref_join_bonus",
+            "ref_first_buy_bonus",
+            "ref_repeat_buy_bonus",
+            "self_first_buy_bonus",
+            "self_repeat_buy_bonus",
+        )
+        cancel_cb = "adm:ref_settings" if is_ref_key else "adm:settings"
+
         hints = {
             "channel_id": (
                 "📢 <b>ID или @username канала</b>\n\n"
@@ -906,36 +1090,50 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             ),
             "channel_url": (
                 "🔗 <b>Ссылка на канал</b>\n\n"
-                "Отправьте ссылку вида <code>https://t.me/...</code> (можно закрытую инвайт-ссылку):"
+                "Отправьте ссылку вида <code>https://t.me/...</code>:"
             ),
             "payment_requisites": (
                 "🏦 <b>Реквизиты для перевода</b>\n\n"
-                "Укажите номер карты / телефон СБП / USDT-кошелек (пользователи смогут скопировать его в 1 клик):"
+                "Укажите номер карты / телефон СБП / USDT-кошелек:"
             ),
             "payment_instructions": (
                 "📝 <b>Инструкция на экране оплаты</b>\n\n"
-                "Например: <i>«Переведите по СБП на Т-Банк (Иван И.) и нажмите кнопку Я оплатил»</i>:"
+                "Отправьте текст инструкции:"
             ),
             "welcome_text": "👋 Отправьте новый приветственный текст для главного меню (/start):",
             "info_text": "ℹ️ Отправьте новый текст для раздела «О проекте»:",
+            "ref_join_bonus": "👥 Введите количество бонусных звёзд за приглашённого друга (например: <code>1</code>):",
+            "ref_first_buy_bonus": "🔥 Введите количество бонусных звёзд рефереру за ПЕРВУЮ покупку друга (например: <code>15</code>):",
+            "ref_repeat_buy_bonus": "🔄 Введите количество бонусных звёзд рефереру за следующие покупки друга (например: <code>5</code>):",
+            "self_first_buy_bonus": "🛍 Введите кэшбэк бонусными звёздами самому покупателю за ПЕРВУЮ покупку (например: <code>20</code>):",
+            "self_repeat_buy_bonus": "🛍 Введите кэшбэк бонусными звёздами покупателю за следующие покупки (например: <code>5</code>):",
         }
         await call.answer()
         await state.set_state(AdminStates.edit_setting_text)
-        await state.update_data(setting_key=key)
+        await state.update_data(setting_key=key, is_ref_key=is_ref_key)
         await render_screen(
             call,
             hints.get(key, "Введите новое значение:"),
-            build_cancel_kb("adm:settings"),
+            build_cancel_kb(cancel_cb),
         )
 
     @router.message(AdminStates.edit_setting_text)
     async def process_setting_text(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         key = data["setting_key"]
+        is_ref_key = bool(data.get("is_ref_key"))
 
-        if key == "channel_id" and message.forward_from_chat:
+        if is_ref_key:
+            raw_num = (message.text or "").strip()
+            if not raw_num.isdigit():
+                await message.answer("Введите целое число (например: 1, 15, 20).")
+                return
+            val = raw_num
+        elif key == "channel_id" and message.forward_from_chat:
             val = str(message.forward_from_chat.id)
-            if message.forward_from_chat.username and not await db.get_setting("channel_url"):
+            if message.forward_from_chat.username and not await db.get_setting(
+                "channel_url"
+            ):
                 await db.set_setting(
                     "channel_url", f"https://t.me/{message.forward_from_chat.username}"
                 )
@@ -948,18 +1146,24 @@ def setup_admin_router(config: Config, db: Database) -> Router:
 
         await state.clear()
         await db.set_setting(key, val)
-        await show_settings_screen(message)
+        if is_ref_key:
+            await show_ref_settings_screen(message)
+        else:
+            await show_settings_screen(message)
 
     @router.callback_query(F.data.startswith("adm:set_photo:"))
     async def cb_set_photo(call: CallbackQuery, state: FSMContext) -> None:
         key = (call.data or "").split(":")[-1]
+        cancel_cb = (
+            "adm:ref_settings" if key == "bonus_banner_photo_id" else "adm:settings"
+        )
         await call.answer()
         await state.set_state(AdminStates.edit_setting_photo)
         await state.update_data(setting_key=key)
         await render_screen(
             call,
-            "🖼 Отправьте картинку (как Фото) для баннера главного меню, или <code>-</code>, чтобы убрать картинку:",
-            build_cancel_kb("adm:settings"),
+            "🖼 Отправьте картинку (как Фото) для баннера раздела, или <code>-</code>, чтобы убрать картинку:",
+            build_cancel_kb(cancel_cb),
         )
 
     @router.message(AdminStates.edit_setting_photo)
@@ -969,17 +1173,25 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         if (message.text or "").strip() == "-":
             await state.clear()
             await db.set_setting(key, "")
-            await show_settings_screen(message)
+            if key == "bonus_banner_photo_id":
+                await show_ref_settings_screen(message)
+            else:
+                await show_settings_screen(message)
             return
         if not message.photo:
-            await message.answer("Пожалуйста, отправьте фото или <code>-</code>.", parse_mode="HTML")
+            await message.answer(
+                "Пожалуйста, отправьте фото или <code>-</code>.", parse_mode="HTML"
+            )
             return
         await state.clear()
         await db.set_setting(key, message.photo[-1].file_id)
-        await show_settings_screen(message)
+        if key == "bonus_banner_photo_id":
+            await show_ref_settings_screen(message)
+        else:
+            await show_settings_screen(message)
 
     # ==========================================
-    # РАССЫЛКА ПО БАЗЕ ПОЛЬЗОВАТЕЛЕЙ
+    # РАССЫЛКА ПО БАЗЕ ПОЛЬЗОВАЛЕЙ
     # ==========================================
 
     @router.callback_query(F.data == "adm:broadcast")
@@ -990,7 +1202,7 @@ def setup_admin_router(config: Config, db: Database) -> Router:
             call,
             "📢 <b>Создание рассылки по базе</b>\n\n"
             "Отправьте пост для рассылки (текст, фото с подписью, видео или документ — "
-            "все форматирование и эмодзи сохранятся):",
+            "все форматирование и кастомные эмодзи сохранятся):",
             build_cancel_kb("adm:menu"),
         )
 
@@ -1025,7 +1237,11 @@ def setup_admin_router(config: Config, db: Database) -> Router:
                 )
                 return
             left, right = [p.strip() for p in raw.split("|", maxsplit=1)]
-            if not left or not (right.startswith("http://") or right.startswith("https://") or right.startswith("tg://")):
+            if not left or not (
+                right.startswith("http://")
+                or right.startswith("https://")
+                or right.startswith("tg://")
+            ):
                 await message.answer("Ссылка должна начинаться с https://")
                 return
             btn_text, btn_url = left, right
@@ -1043,7 +1259,9 @@ def setup_admin_router(config: Config, db: Database) -> Router:
         data = await state.get_data()
         users = await db.get_all_active_user_ids()
 
-        await message.answer("👁 <b>Предпросмотр вашей рассылки:</b>", parse_mode="HTML")
+        await message.answer(
+            "👁 <b>Предпросмотр вашей рассылки:</b>", parse_mode="HTML"
+        )
         await bot.copy_message(
             chat_id=message.chat.id,
             from_chat_id=data["bc_chat_id"],

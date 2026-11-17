@@ -17,6 +17,7 @@ from aiogram.types import (
 
 from app.config import Config
 from app.database import Database
+from app.emojis import ce
 from app.handlers.user import SubscriptionGateMiddleware, render_screen
 from app.keyboards import (
     build_cancel_kb,
@@ -35,6 +36,56 @@ class PaymentStates(StatesGroup):
 def _strip_html(raw: str) -> str:
     clean = re.sub(r"<[^>]+>", "", raw or "").strip()
     return clean or "Оплата цифрового материала"
+
+
+async def notify_purchase_bonuses(bot: Bot, db: Database, buyer_id: int) -> None:
+    """Начисляет бонусы за покупку рефереру и самому покупателю и рассылает уведомления."""
+    res = await db.process_purchase_bonuses(buyer_id)
+    if not res:
+        return
+
+    settings = await db.get_all_settings()
+    use_ce = settings.get("use_custom_emoji", "1") == "1"
+
+    buyer_bonus = int(res.get("buyer_bonus") or 0)
+    if buyer_bonus > 0:
+        try:
+            await bot.send_message(
+                chat_id=buyer_id,
+                text=(
+                    f"{ce('star', use_ce)} <b>Бонус за покупку!</b>\n"
+                    f"Тебе начислено <b>+{buyer_bonus}</b> {ce('star', use_ce)} на бонусный баланс."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    referrer_id = res.get("referrer_id")
+    ref_bonus = int(res.get("ref_bonus") or 0)
+    if referrer_id and ref_bonus > 0:
+        uname = res.get("buyer_username")
+        if uname:
+            buyer_label = f"@{html.escape(uname)}"
+        else:
+            bname = html.escape(res.get("buyer_name") or f"ID {buyer_id}")
+            buyer_label = f"<b>{bname}</b>"
+
+        action_str = (
+            "за первую покупку" if res.get("is_first") else "за покупку"
+        )
+        ref_msg = (
+            f"{ce('coin', use_ce)} Тебе начислено <b>{ref_bonus}</b> {ce('star', use_ce)} "
+            f"{action_str} {buyer_label}"
+        )
+        try:
+            await bot.send_message(
+                chat_id=int(referrer_id),
+                text=ref_msg,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 def setup_payments_router(config: Config, db: Database) -> Router:
@@ -66,7 +117,10 @@ def setup_payments_router(config: Config, db: Database) -> Router:
         enable_stars = await db.get_setting("enable_stars", "1")
         stars_amount = int(item.get("price_stars") or 0)
         if enable_stars != "1" or stars_amount <= 0:
-            await call.answer("Оплата через Telegram Stars недоступна для этого товара", show_alert=True)
+            await call.answer(
+                "Оплата через Telegram Stars недоступна для этого товара",
+                show_alert=True,
+            )
             return
 
         await call.answer()
@@ -78,7 +132,7 @@ def setup_payments_router(config: Config, db: Database) -> Router:
             title=title,
             description=desc,
             payload=f"stars_item:{item_id}:{call.from_user.id}",
-            provider_token="",  # Для Telegram Stars (XTR) всегда пустая строка
+            provider_token="",
             currency="XTR",
             prices=[LabeledPrice(label=title, amount=stars_amount)],
             reply_markup=InlineKeyboardMarkup(
@@ -151,10 +205,12 @@ def setup_payments_router(config: Config, db: Database) -> Router:
         if item:
             await deliver_item_content(bot, message.chat.id, item)
 
+        await notify_purchase_bonuses(bot, db, user.id)
+
         uname = f"@{user.username}" if user.username else "без @username"
         item_title = html.escape(item["title"]) if item else f"#{item_id}"
         notify_text = (
-            f"💰 <b>Новая авто-продажа (Telegram Stars)!</b>\n"
+            f"💰 <b>Новая продажа за Telegram Stars!</b>\n"
             f"Заказ: <code>#{order_id}</code>\n"
             f"Товар: <b>{item_title}</b>\n"
             f"Сумма: <b>⭐️ {sp.total_amount} XTR</b>\n"
@@ -167,7 +223,62 @@ def setup_payments_router(config: Config, db: Database) -> Router:
                 pass
 
     # ==========================================
-    # 2. ПОЛУАВТОМАТ ПО РЕКВИЗИТАМ (СБП / КАРТА / КРИПТА)
+    # 2. ПОКУПКА ЗА БОНУСНЫЕ ЗВЁЗДЫ (ОБМЕН БОНУСОВ)
+    # ==========================================
+
+    @router.callback_query(F.data.startswith("pay:bonus:"))
+    async def cb_pay_bonus(call: CallbackQuery, bot: Bot) -> None:
+        raw_id = (call.data or "").split(":")[-1]
+        if not raw_id.isdigit() or not call.message:
+            await call.answer()
+            return
+
+        item_id = int(raw_id)
+        item = await db.get_item(item_id)
+        if not item or not item.get("is_active"):
+            await call.answer("Материал недоступен", show_alert=True)
+            return
+
+        ok, status = await db.spend_bonus_for_item(call.from_user.id, item_id)
+        if not ok:
+            if status == "already_owned":
+                await call.answer("У вас уже открыт доступ!", show_alert=True)
+                await deliver_item_content(bot, call.message.chat.id, item)
+                return
+            if status.startswith("insufficient:"):
+                _, bal, cost = status.split(":")
+                await call.answer(
+                    f"❌ Недостаточно бонусных звёзд!\nВаш баланс: {bal} ⭐️, нужно: {cost} ⭐️.\nПриглашайте друзей в разделе «Бонусная система»!",
+                    show_alert=True,
+                )
+                return
+            await call.answer("Этот товар нельзя обменять за бонусы", show_alert=True)
+            return
+
+        await call.answer("🎉 Бонусы обменяны! Отправляю материал...")
+        cost = int(item.get("price_bonus_stars") or 0)
+        await call.message.answer(
+            f"🎁 <b>Обмен успешно выполнен!</b> Списано <b>{cost} ⭐️</b> с бонусного баланса.",
+            parse_mode="HTML",
+        )
+        await deliver_item_content(bot, call.message.chat.id, item)
+
+        user = call.from_user
+        uname = f"@{user.username}" if user.username else "без @username"
+        notify_text = (
+            f"🎁 <b>Обмен бонусных звёзд!</b>\n"
+            f"Товар: <b>{html.escape(item['title'])}</b>\n"
+            f"Списано бонусов: <b>{cost} ⭐️</b>\n"
+            f"Пользователь: <b>{html.escape(user.full_name)}</b> ({uname}, <code>{user.id}</code>)"
+        )
+        for admin_id in config.admin_ids:
+            try:
+                await bot.send_message(admin_id, notify_text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    # ==========================================
+    # 3. ПОЛУАВТОМАТ ПО РЕКВИЗИТАМ (СБП / КАРТА / КРИПТА)
     # ==========================================
 
     @router.callback_query(F.data.startswith("pay:manual:"))
@@ -194,7 +305,7 @@ def setup_payments_router(config: Config, db: Database) -> Router:
         requisites = settings.get("payment_requisites", "").strip()
         instructions = settings.get("payment_instructions", "").strip()
 
-        if settings.get("enable_manual_pay", "1") != "1" or price_rub <= 0:
+        if settings.get("enable_manual_pay", "0") != "1" or price_rub <= 0:
             await call.answer("Этот способ оплаты сейчас отключен", show_alert=True)
             return
 
@@ -345,6 +456,8 @@ def setup_payments_router(config: Config, db: Database) -> Router:
                         reply_markup=review_kb,
                     )
             except Exception as exc:
-                logger.warning("Ошибка отправки заявки #%s админу %s: %s", order_id, admin_id, exc)
+                logger.warning(
+                    "Ошибка отправки заявки #%s админу %s: %s", order_id, admin_id, exc
+                )
 
     return router

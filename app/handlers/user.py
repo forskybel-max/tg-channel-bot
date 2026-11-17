@@ -20,12 +20,16 @@ from aiogram.types import (
 
 from app.config import Config
 from app.database import Database
+from app.emojis import ce, strip_custom_emoji_from_markup
 from app.keyboards import (
+    build_bonus_system_kb,
     build_cancel_kb,
     build_catalog_kb,
+    build_exchange_kb,
     build_item_card_kb,
     build_main_menu_kb,
     build_my_items_kb,
+    build_profile_kb,
     build_sub_gate_kb,
     format_price_badge,
 )
@@ -36,13 +40,58 @@ logger = logging.getLogger(__name__)
 
 SUB_GATE_TEXT = (
     "🔒 <b>Доступ к боту открыт только для подписчиков канала!</b>\n\n"
-    "Чтобы пользоваться ботом, открывать бесплатные гайды и базу материалов, "
+    "Чтобы пользоваться ботом, открывать бесплатные гайды, каталог и получать бонусные звёзды, "
     "подпишитесь на наш канал и нажмите зелёную кнопку проверки ниже 👇"
 )
 
 
 class UserStates(StatesGroup):
     waiting_support_msg = State()
+
+
+def _parse_ref_id(payload: str) -> int | None:
+    if payload.startswith("ref_"):
+        raw = payload[len("ref_") :].strip()
+        if raw.isdigit():
+            return int(raw)
+    return None
+
+
+async def notify_referrer_if_needed(bot: Bot, db: Database, user_id: int) -> None:
+    """Если новый пользователь пришел по рефке и подписался на канал — начисляет +1 звезду и шлет пуш."""
+    reward = await db.process_referral_join(user_id)
+    if not reward:
+        return
+
+    settings = await db.get_all_settings()
+    use_ce = settings.get("use_custom_emoji", "1") == "1"
+
+    uname = reward.get("friend_username")
+    if uname:
+        friend_label = f"@{html.escape(uname)}"
+    else:
+        fname = html.escape(reward.get("friend_name") or f"ID {reward['friend_id']}")
+        friend_label = f"<b>{fname}</b>"
+
+    bonus = reward["bonus"]
+    star_word = (
+        "бонусная звезда начислена"
+        if bonus == 1
+        else f"бонусных звёзд начислено"
+    )
+    msg_text = (
+        f"{ce('rocket', use_ce)} <b>Приглашение успешно!</b>\n\n"
+        f"{ce('check_box', use_ce)} Твой друг {friend_label} присоединился к боту\n\n"
+        f"{ce('star', use_ce)} <b>+{bonus} {star_word}</b>"
+    )
+    try:
+        await bot.send_message(
+            chat_id=reward["referrer_id"],
+            text=msg_text,
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.debug("Не удалось отправить пуш рефереру %s: %s", reward["referrer_id"], exc)
 
 
 class SubscriptionGateMiddleware(BaseMiddleware):
@@ -58,12 +107,14 @@ class SubscriptionGateMiddleware(BaseMiddleware):
     ) -> None:
         now = time.monotonic()
         last_ts = self._seen_users_ts.get(user_id)
-        if payload or last_ts is None or (now - last_ts) > 600.0:
+        ref_id = _parse_ref_id(payload)
+        if payload or ref_id or last_ts is None or (now - last_ts) > 600.0:
             await self.db.upsert_user(
                 user_id=user_id,
                 username=username,
                 full_name=full_name,
                 source_param=payload,
+                referrer_id=ref_id,
             )
             if len(self._seen_users_ts) > 10000:
                 self._seen_users_ts.clear()
@@ -100,25 +151,28 @@ class SubscriptionGateMiddleware(BaseMiddleware):
                 payload=payload,
             )
 
-            if user.id in self.config.admin_ids:
-                return await handler(event, data)
-
-            is_sub, ch_url = await check_user_subscription(
-                bot, self.db, user.id, self.config.admin_ids
-            )
-            if not is_sub:
-                retry_target = (
-                    payload
-                    if payload.startswith("item_") and len(payload) < 32
-                    else "home"
+            if user.id not in self.config.admin_ids:
+                is_sub, ch_url = await check_user_subscription(
+                    bot, self.db, user.id, self.config.admin_ids
                 )
-                await render_screen(
-                    event,
-                    SUB_GATE_TEXT,
-                    build_sub_gate_kb(ch_url, f"sub:check:{retry_target}"),
-                )
-                return None
+                if not is_sub:
+                    settings = await self.db.get_all_settings()
+                    use_ce = settings.get("use_custom_emoji", "1") == "1"
+                    retry_target = (
+                        payload
+                        if payload.startswith("item_") and len(payload) < 32
+                        else "home"
+                    )
+                    await render_screen(
+                        event,
+                        SUB_GATE_TEXT,
+                        build_sub_gate_kb(
+                            ch_url, f"sub:check:{retry_target}", use_ce=use_ce
+                        ),
+                    )
+                    return None
 
+            await notify_referrer_if_needed(bot, self.db, user.id)
             return await handler(event, data)
 
         if isinstance(event, CallbackQuery):
@@ -141,6 +195,8 @@ class SubscriptionGateMiddleware(BaseMiddleware):
                     "Для работы с ботом необходимо подписаться на канал!",
                     show_alert=True,
                 )
+                settings = await self.db.get_all_settings()
+                use_ce = settings.get("use_custom_emoji", "1") == "1"
                 retry_target = "home"
                 if cb_data.startswith(("item:view:", "item:claim:")):
                     raw_id = cb_data.split(":")[-1]
@@ -150,10 +206,13 @@ class SubscriptionGateMiddleware(BaseMiddleware):
                 await render_screen(
                     event,
                     SUB_GATE_TEXT,
-                    build_sub_gate_kb(ch_url, f"sub:check:{retry_target}"),
+                    build_sub_gate_kb(
+                        ch_url, f"sub:check:{retry_target}", use_ce=use_ce
+                    ),
                 )
                 return None
 
+            await notify_referrer_if_needed(bot, self.db, user.id)
             return await handler(event, data)
 
         return await handler(event, data)
@@ -165,34 +224,56 @@ async def render_screen(
     reply_markup: InlineKeyboardMarkup,
     photo_id: str = "",
 ) -> None:
-    """Плавная отрисовка экрана (редактирует сообщение на месте, если возможно)."""
+    """Плавная отрисовка экрана с автоматическим фоллбэком кастомных эмодзи."""
     photo_id = (photo_id or "").strip()
 
-    if isinstance(event, Message):
+    async def _send_new(msg_target: Message, markup: InlineKeyboardMarkup) -> None:
         if photo_id:
             try:
-                await event.answer_photo(
+                await msg_target.answer_photo(
                     photo=photo_id,
                     caption=text[:1024],
                     parse_mode="HTML",
-                    reply_markup=reply_markup,
+                    reply_markup=markup,
                 )
                 return
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as exc:
+                if "CUSTOM_EMOJI" in str(exc).upper():
+                    fallback_kb = strip_custom_emoji_from_markup(markup)
+                    await msg_target.answer_photo(
+                        photo=photo_id,
+                        caption=text[:1024],
+                        parse_mode="HTML",
+                        reply_markup=fallback_kb,
+                    )
+                    return
+
         try:
-            await event.answer(
+            await msg_target.answer(
                 text=text[:4096],
                 parse_mode="HTML",
-                reply_markup=reply_markup,
+                reply_markup=markup,
                 disable_web_page_preview=True,
             )
-        except TelegramBadRequest:
-            await event.answer(
-                text=text[:4096],
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+        except TelegramBadRequest as exc:
+            if "CUSTOM_EMOJI" in str(exc).upper():
+                fallback_kb = strip_custom_emoji_from_markup(markup)
+                await msg_target.answer(
+                    text=text[:4096],
+                    parse_mode="HTML",
+                    reply_markup=fallback_kb,
+                    disable_web_page_preview=True,
+                )
+            else:
+                fallback_kb = strip_custom_emoji_from_markup(markup)
+                await msg_target.answer(
+                    text=text[:4096],
+                    reply_markup=fallback_kb,
+                    disable_web_page_preview=True,
+                )
+
+    if isinstance(event, Message):
+        await _send_new(event, reply_markup)
         return
 
     msg = event.message
@@ -219,55 +300,55 @@ async def render_screen(
             )
             return
     except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc).lower():
+        err_up = str(exc).upper()
+        if "MESSAGE IS NOT MODIFIED" in err_up:
             return
+        if "CUSTOM_EMOJI" in err_up:
+            fallback_kb = strip_custom_emoji_from_markup(reply_markup)
+            try:
+                if not photo_id and not has_current_photo and msg.text is not None:
+                    await msg.edit_text(
+                        text=text[:4096],
+                        parse_mode="HTML",
+                        reply_markup=fallback_kb,
+                        disable_web_page_preview=True,
+                    )
+                    return
+            except TelegramBadRequest:
+                pass
 
     try:
         await msg.delete()
     except TelegramBadRequest:
         pass
 
-    if photo_id:
-        try:
-            await msg.answer_photo(
-                photo=photo_id,
-                caption=text[:1024],
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-            )
-            return
-        except TelegramBadRequest:
-            pass
-
-    try:
-        await msg.answer(
-            text=text[:4096],
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
-    except TelegramBadRequest:
-        await msg.answer(
-            text=text[:4096],
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+    await _send_new(msg, reply_markup)
 
 
 def format_item_card_text(
-    item: dict[str, Any], settings: dict[str, str], has_access: bool
+    item: dict[str, Any],
+    settings: dict[str, str],
+    has_access: bool,
+    user_bonus: int = 0,
 ) -> str:
-    icon = "💎" if item.get("is_paid") else "📘"
+    use_ce = settings.get("use_custom_emoji", "1") == "1"
+    icon = (
+        ce("diamond", use_ce)
+        if item.get("is_paid")
+        else ce("book", use_ce)
+    )
     title = html.escape(item.get("title", "Материал"))
     desc = (item.get("description") or "").strip()
 
     if has_access:
-        status_line = "✅ <b>Доступ открыт</b>"
-    elif not item.get("is_paid"):
-        status_line = "🎁 <b>Доступно бесплатно</b>"
+        status_line = f"{ce('check', use_ce)} <b>Доступ открыт</b>"
+    elif not item.get("is_paid") and int(item.get("price_bonus_stars") or 0) <= 0:
+        status_line = f"{ce('gift', use_ce)} <b>Доступно бесплатно</b>"
     else:
         badge = format_price_badge(item, settings)
-        status_line = f"💳 <b>Стоимость:</b> {badge}"
+        status_line = f"{ce('star', use_ce)} <b>Стоимость:</b> {badge}"
+        if int(item.get("price_bonus_stars") or 0) > 0:
+            status_line += f"\n{ce('coin', use_ce)} <b>Ваши бонусы:</b> {user_bonus} ⭐️"
 
     parts = [f"{icon} <b>{title}</b>"]
     if desc:
@@ -292,17 +373,31 @@ def setup_user_router(config: Config, db: Database) -> Router:
 
     async def show_home(event: Message | CallbackQuery, user_id: int) -> None:
         settings = await db.get_all_settings()
-        show_paid = settings.get("show_paid_section", "0") == "1"
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        show_paid = settings.get("show_paid_section", "1") == "1"
         channel_url = settings.get("channel_url", "").strip()
         welcome_text = (
-            settings.get("welcome_text", "").strip() or "👋 Добро пожаловать!"
+            settings.get("welcome_text", "").strip()
+            or f"{ce('star', use_ce)} <b>Добро пожаловать!</b>"
         )
         welcome_photo = settings.get("welcome_photo_id", "").strip()
+
+        if settings.get("show_profile_in_home", "1") == "1":
+            u = await db.get_user(user_id)
+            bonus_stars = int(u["bonus_stars"]) if u else 0
+            refs_cnt = int(u["referrals_count"]) if u else 0
+            profile_block = (
+                f"{ce('id_card', use_ce)} Telegram ID: <code>{user_id}</code>\n"
+                f"{ce('star', use_ce)} Бонусы: <b>{bonus_stars} ⭐️</b>\n"
+                f"{ce('users', use_ce)} Рефералов: <b>{refs_cnt}</b>"
+            )
+            welcome_text = f"{welcome_text}\n\n{profile_block}"
 
         kb = build_main_menu_kb(
             show_paid_section=show_paid,
             is_admin=user_id in config.admin_ids,
             channel_url=channel_url,
+            use_ce=use_ce,
         )
         await render_screen(event, welcome_text, kb, photo_id=welcome_photo)
 
@@ -314,6 +409,8 @@ def setup_user_router(config: Config, db: Database) -> Router:
     ) -> None:
         settings = await db.get_all_settings()
         has_access = await db.has_access(user_id, item["id"])
+        u = await db.get_user(user_id)
+        user_bonus = int(u["bonus_stars"]) if u else 0
         bot_uname = await get_bot_username(bot) if user_id in config.admin_ids else ""
 
         if item.get("category_id"):
@@ -322,7 +419,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
         else:
             back_cb = "nav:shop" if item.get("is_paid") else "nav:guides"
 
-        card_text = format_item_card_text(item, settings, has_access)
+        card_text = format_item_card_text(item, settings, has_access, user_bonus=user_bonus)
         kb = build_item_card_kb(
             item=item,
             has_access=has_access,
@@ -349,7 +446,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
         if not item or (not item.get("is_active") and user_id not in config.admin_ids):
             return False
 
-        if not item.get("is_paid"):
+        if not item.get("is_paid") and int(item.get("price_bonus_stars") or 0) <= 0:
             await db.grant_access(user_id, item["id"], access_type="free")
             await deliver_item_content(bot, chat_id, item)
             return True
@@ -361,7 +458,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
     async def cb_sub_check(
         call: CallbackQuery, state: FSMContext, bot: Bot
     ) -> None:
-        is_sub, ch_url = await check_user_subscription(
+        is_sub, _ = await check_user_subscription(
             bot, db, call.from_user.id, config.admin_ids, force_refresh=True
         )
         if not is_sub:
@@ -373,6 +470,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
 
         await state.clear()
         await call.answer("✅ Подписка подтверждена! Добро пожаловать!")
+        await notify_referrer_if_needed(bot, db, call.from_user.id)
 
         parts = (call.data or "").split(":", maxsplit=2)
         target = parts[2] if len(parts) == 3 else "home"
@@ -427,6 +525,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
         is_paid = section == "shop"
 
         settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
         categories = await db.get_categories(
             section=section, only_with_active_items=True
         )
@@ -435,18 +534,18 @@ def setup_user_router(config: Config, db: Database) -> Router:
         )
 
         if section == "guides":
-            header = "📚 <b>Бесплатные гайды и база знаний</b>"
+            header = f"{ce('books', use_ce)} <b>Бесплатные гайды и база знаний</b>"
             empty_hint = (
-                "Здесь пока нет опубликованных материалов. Скоро добавим свежие гайды!"
+                "Здесь пока нет опубликованных гайдов. Скоро добавим свежие материалы!"
             )
         else:
-            header = "🔥 <b>Продукты и закрытые материалы</b>"
-            empty_hint = "Платные продукты сейчас готовятся к запуску. Следите за анонсами в канале!"
+            header = f"{ce('cart', use_ce)} <b>Каталог товаров и доступов</b>"
+            empty_hint = "Товары в каталоге сейчас пополняются. Загляните чуть позже!"
 
         if not categories and not uncat_items:
             text = f"{header}\n\n<i>{empty_hint}</i>"
         else:
-            text = f"{header}\n\n👇 Выберите нужный раздел или материал:"
+            text = f"{header}\n\n{ce('point_down', use_ce)} Выберите нужную категорию или позицию:"
 
         kb = build_catalog_kb(
             section=section,
@@ -473,10 +572,15 @@ def setup_user_router(config: Config, db: Database) -> Router:
             return
 
         settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
         items = await db.get_catalog_items(is_paid=is_paid, category_id=cat_id)
-        text = f"📁 <b>{html.escape(category['title'])}</b>\n\n👇 Доступные материалы в разделе:"
+        icon = ce("books" if section == "guides" else "bags", use_ce)
+        text = (
+            f"{icon} <b>{html.escape(category['title'])}</b>\n\n"
+            f"{ce('point_down', use_ce)} Доступные материалы в разделе:"
+        )
         if not items:
-            text = f"📁 <b>{html.escape(category['title'])}</b>\n\n<i>В этой папке пока пусто.</i>"
+            text = f"{icon} <b>{html.escape(category['title'])}</b>\n\n<i>В этой категории пока пусто.</i>"
 
         kb = build_catalog_kb(
             section=section,
@@ -486,6 +590,109 @@ def setup_user_router(config: Config, db: Database) -> Router:
             in_category=True,
         )
         await render_screen(call, text, kb)
+
+    @router.callback_query(F.data == "nav:profile")
+    async def cb_profile(call: CallbackQuery, bot: Bot) -> None:
+        await call.answer()
+        uid = call.from_user.id
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        u = await db.get_user(uid)
+        owned = await db.get_user_items(uid)
+        bot_uname = await get_bot_username(bot)
+        ref_link = f"https://t.me/{bot_uname}?start=ref_{uid}"
+
+        bonus_stars = int(u["bonus_stars"]) if u else 0
+        refs_cnt = int(u["referrals_count"]) if u else 0
+        orders_cnt = int(u["paid_orders_count"]) if u else 0
+        uname_str = f"@{call.from_user.username}" if call.from_user.username else "—"
+
+        text = (
+            f"{ce('id_card', use_ce)} <b>Личный профиль</b>\n\n"
+            f"▪ <b>Telegram ID:</b> <code>{uid}</code>\n"
+            f"▪ <b>Username:</b> {html.escape(uname_str)}\n"
+            f"▪ <b>Бонусный баланс:</b> <b>{bonus_stars}</b> {ce('star', use_ce)}\n"
+            f"▪ <b>Приглашено друзей:</b> <b>{refs_cnt}</b> {ce('users', use_ce)}\n"
+            f"▪ <b>Покупок в каталоге:</b> <b>{orders_cnt}</b>\n"
+            f"▪ <b>Открыто материалов:</b> <b>{len(owned)}</b>\n\n"
+            f"{ce('link', use_ce)} <b>Ваша реф. ссылка:</b>\n<code>{ref_link}</code>"
+        )
+        await render_screen(call, text, build_profile_kb(use_ce=use_ce))
+
+    @router.callback_query(F.data == "nav:bonuses")
+    async def cb_bonuses(call: CallbackQuery, bot: Bot) -> None:
+        await call.answer()
+        uid = call.from_user.id
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        u = await db.get_user(uid)
+        bot_uname = await get_bot_username(bot)
+        ref_link = f"https://t.me/{bot_uname}?start=ref_{uid}"
+
+        bonus_stars = int(u["bonus_stars"]) if u else 0
+        refs_cnt = int(u["referrals_count"]) if u else 0
+
+        r_join = settings.get("ref_join_bonus", "1")
+        r_first = settings.get("ref_first_buy_bonus", "15")
+        r_rep = settings.get("ref_repeat_buy_bonus", "5")
+        s_first = settings.get("self_first_buy_bonus", "20")
+        s_rep = settings.get("self_repeat_buy_bonus", "5")
+        banner_id = settings.get("bonus_banner_photo_id", "").strip()
+
+        star_ic = ce("star", use_ce)
+        text = (
+            f"{ce('sparkle', use_ce)} <b>Бонусная система</b>\n"
+            f"Приглашай друзей — получай звёзды!\n\n"
+            f"{ce('bags', use_ce)} <b>Покупай сам</b>\n"
+            f"▪ Первая покупка → <b>+{s_first}</b> {star_ic}\n"
+            f"▪ Каждая следующая → <b>+{s_rep}</b> {star_ic}\n\n"
+            f"{ce('users', use_ce)} <b>Приглашай друзей</b>\n"
+            f"▪ Новый друг по ссылке → <b>+{r_join}</b> {star_ic}\n"
+            f"▪ Его первая покупка → <b>+{r_first}</b> {star_ic}\n"
+            f"▪ Его следующие покупки → <b>+{r_rep}</b> {star_ic}\n\n"
+            f"{ce('coin', use_ce)} <b>Твои бонусы:</b> <b>{bonus_stars}</b> {star_ic} "
+            f"(друзей: <b>{refs_cnt}</b>)\n\n"
+            f"{ce('link', use_ce)} <b>Твоя ссылка для приглашений:</b>\n"
+            f"<code>{ref_link}</code>"
+        )
+        await render_screen(
+            call,
+            text,
+            build_bonus_system_kb(ref_link=ref_link, use_ce=use_ce),
+            photo_id=banner_id,
+        )
+
+    @router.callback_query(F.data == "nav:exchange")
+    async def cb_exchange(call: CallbackQuery) -> None:
+        await call.answer()
+        uid = call.from_user.id
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        u = await db.get_user(uid)
+        bonus_stars = int(u["bonus_stars"]) if u else 0
+        items = await db.get_bonus_exchange_items()
+
+        header = (
+            f"{ce('exchange', use_ce)} <b>Обмен бонусных звёзд</b>\n\n"
+            f"{ce('coin', use_ce)} Ваш доступный баланс: <b>{bonus_stars}</b> {ce('star', use_ce)}\n\n"
+        )
+        if not items:
+            text = (
+                f"{header}"
+                "<i>Сейчас список бонусных товаров пополняется. "
+                "Приглашайте друзей и копите звёзды — скоро здесь появятся эксклюзивные материалы!</i>"
+            )
+        else:
+            text = (
+                f"{header}"
+                f"{ce('point_down', use_ce)} Выберите товар, который хотите забрать за накопленные бонусные звёзды:"
+            )
+
+        await render_screen(
+            call,
+            text,
+            build_exchange_kb(items=items, user_bonus=bonus_stars, use_ce=use_ce),
+        )
 
     @router.callback_query(F.data.startswith("item:view:"))
     async def cb_item_view(call: CallbackQuery, bot: Bot) -> None:
@@ -513,8 +720,8 @@ def setup_user_router(config: Config, db: Database) -> Router:
         if not item or not item.get("is_active"):
             await call.answer("Материал больше недоступен", show_alert=True)
             return
-        if item.get("is_paid"):
-            await call.answer("Этот материал платный", show_alert=True)
+        if item.get("is_paid") or int(item.get("price_bonus_stars") or 0) > 0:
+            await call.answer("Этот материал находится в каталоге", show_alert=True)
             await show_item_card(call, bot, call.from_user.id, item)
             return
 
@@ -545,24 +752,28 @@ def setup_user_router(config: Config, db: Database) -> Router:
     @router.callback_query(F.data == "nav:my_items")
     async def cb_my_items(call: CallbackQuery) -> None:
         await call.answer()
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
         items = await db.get_user_items(call.from_user.id)
         if not items:
             text = (
-                "🎒 <b>Мои материалы</b>\n\n"
+                f"{ce('gift', use_ce)} <b>Мои материалы и покупки</b>\n\n"
                 "У вас пока нет открытых гайдов или покупок.\n"
-                "Загляните в раздел <b>«📚 Бесплатные гайды и база»</b>!"
+                "Загляните в раздел <b>«📚 Гайды»</b> или <b>«🛒 Каталог»</b>!"
             )
         else:
             text = (
-                f"🎒 <b>Мои материалы ({len(items)})</b>\n\n"
-                "Нажмите на любой материал, чтобы открыть его снова:"
+                f"{ce('gift', use_ce)} <b>Мои материалы ({len(items)})</b>\n\n"
+                f"{ce('point_down', use_ce)} Нажмите на любой материал, чтобы открыть его снова:"
             )
-        await render_screen(call, text, build_my_items_kb(items))
+        await render_screen(call, text, build_my_items_kb(items, use_ce=use_ce))
 
     @router.callback_query(F.data == "nav:info")
     async def cb_info(call: CallbackQuery) -> None:
         await call.answer()
-        info_text = await db.get_setting("info_text", "ℹ️ Информация скоро появится.")
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        info_text = settings.get("info_text", "ℹ️ Информация скоро появится.")
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -581,10 +792,12 @@ def setup_user_router(config: Config, db: Database) -> Router:
     async def cb_support_start(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         await state.set_state(UserStates.waiting_support_msg)
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
         text = (
-            "💬 <b>Связь с автором / Предложка / Реклама</b>\n\n"
-            "Напишите ваш вопрос, предложение или запрос на сотрудничество одним сообщением "
-            "(можно прикрепить фото или файл) — я сразу передам его автору канала:"
+            f"{ce('chat', use_ce)} <b>Поддержка и сотрудничество</b>\n\n"
+            "Напишите ваш вопрос, предложение или запрос одним сообщением "
+            "(можно прикрепить фото или файл) — я сразу передам его автору:"
         )
         await render_screen(call, text, build_cancel_kb("nav:home"))
 

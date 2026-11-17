@@ -1,3 +1,4 @@
+import urllib.parse
 from typing import Any
 from aiogram.enums import ButtonStyle
 from aiogram.types import (
@@ -7,15 +8,34 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
+from app.emojis import ce_id
+
+
+def _btn(
+    text: str,
+    emoji_key: str = "",
+    fallback_prefix: str = "",
+    use_ce: bool = True,
+    **kwargs: Any,
+) -> InlineKeyboardButton:
+    """Создает инлайн-кнопку с кастомным анимированным эмодзи (или обычным префиксом, если отключено)."""
+    cid = ce_id(emoji_key, enabled=use_ce) if emoji_key else None
+    if cid:
+        return InlineKeyboardButton(text=text, icon_custom_emoji_id=cid, **kwargs)
+    label = f"{fallback_prefix} {text}".strip() if fallback_prefix else text
+    return InlineKeyboardButton(text=label, **kwargs)
+
 
 def format_price_badge(item: dict[str, Any], settings: dict[str, str]) -> str:
-    if not item.get("is_paid"):
+    if not item.get("is_paid") and int(item.get("price_bonus_stars") or 0) <= 0:
         return "Бесплатно"
     parts: list[str] = []
-    if settings.get("enable_manual_pay", "1") == "1" and int(item.get("price_rub") or 0) > 0:
-        parts.append(f"{item['price_rub']} ₽")
     if settings.get("enable_stars", "1") == "1" and int(item.get("price_stars") or 0) > 0:
-        parts.append(f"⭐️ {item['price_stars']}")
+        parts.append(f"{item['price_stars']} ⭐️")
+    if int(item.get("price_bonus_stars") or 0) > 0:
+        parts.append(f"{item['price_bonus_stars']} бон. ⭐️")
+    if settings.get("enable_manual_pay", "0") == "1" and int(item.get("price_rub") or 0) > 0:
+        parts.append(f"{item['price_rub']} ₽")
     return " / ".join(parts) if parts else "Скоро"
 
 
@@ -23,41 +43,107 @@ def build_main_menu_kb(
     show_paid_section: bool,
     is_admin: bool,
     channel_url: str = "",
+    use_ce: bool = True,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(
-                text="📚 Бесплатные гайды и база",
-                callback_data="nav:guides",
-                style=ButtonStyle.PRIMARY,
-            )
-        ]
-    ]
+    rows: list[list[InlineKeyboardButton]] = []
 
     if show_paid_section:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text="🔥 Продукты и закрытые материалы",
+                _btn(
+                    text="Гайды",
+                    emoji_key="books",
+                    fallback_prefix="📚",
+                    use_ce=use_ce,
+                    callback_data="nav:guides",
+                    style=ButtonStyle.PRIMARY,
+                ),
+                _btn(
+                    text="Каталог",
+                    emoji_key="cart",
+                    fallback_prefix="🛒",
+                    use_ce=use_ce,
                     callback_data="nav:shop",
-                    style=ButtonStyle.SUCCESS,
+                    style=ButtonStyle.PRIMARY,
+                ),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                _btn(
+                    text="Бесплатные гайды и база",
+                    emoji_key="books",
+                    fallback_prefix="📚",
+                    use_ce=use_ce,
+                    callback_data="nav:guides",
+                    style=ButtonStyle.PRIMARY,
                 )
             ]
         )
 
     rows.append(
         [
-            InlineKeyboardButton(text="🎒 Мои материалы", callback_data="nav:my_items"),
-            InlineKeyboardButton(text="ℹ️ О проекте", callback_data="nav:info"),
+            _btn(
+                text="Профиль",
+                emoji_key="id_card",
+                fallback_prefix="🪪",
+                use_ce=use_ce,
+                callback_data="nav:profile",
+            ),
+            _btn(
+                text="О проекте",
+                emoji_key="book",
+                fallback_prefix="📖",
+                use_ce=use_ce,
+                callback_data="nav:info",
+            ),
+        ]
+    )
+
+    rows.append(
+        [
+            _btn(
+                text="Обмен бонусов",
+                emoji_key="exchange",
+                fallback_prefix="🔁",
+                use_ce=use_ce,
+                callback_data="nav:exchange",
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            _btn(
+                text="Бонусная система",
+                emoji_key="star",
+                fallback_prefix="⭐️",
+                use_ce=use_ce,
+                callback_data="nav:bonuses",
+                style=ButtonStyle.SUCCESS,
+            )
         ]
     )
 
     contact_row = [
-        InlineKeyboardButton(text="💬 Связь с автором", callback_data="nav:support")
+        _btn(
+            text="Поддержка",
+            emoji_key="chat",
+            fallback_prefix="💬",
+            use_ce=use_ce,
+            callback_data="nav:support",
+        )
     ]
     if channel_url:
         contact_row.append(
-            InlineKeyboardButton(text="📢 Наш канал", url=channel_url)
+            _btn(
+                text="Наш канал",
+                emoji_key="rocket",
+                fallback_prefix="📢",
+                use_ce=use_ce,
+                url=channel_url,
+            )
         )
     rows.append(contact_row)
 
@@ -75,13 +161,138 @@ def build_main_menu_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_sub_gate_kb(channel_url: str, retry_callback: str = "sub:check:home") -> InlineKeyboardMarkup:
+def build_profile_kb(use_ce: bool = True) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _btn(
+                    text="Мои материалы и покупки",
+                    emoji_key="gift",
+                    fallback_prefix="🎒",
+                    use_ce=use_ce,
+                    callback_data="nav:my_items",
+                    style=ButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                _btn(
+                    text="Бонусная система",
+                    emoji_key="star",
+                    fallback_prefix="⭐️",
+                    use_ce=use_ce,
+                    callback_data="nav:bonuses",
+                    style=ButtonStyle.SUCCESS,
+                ),
+                _btn(
+                    text="Обмен бонусов",
+                    emoji_key="exchange",
+                    fallback_prefix="🔁",
+                    use_ce=use_ce,
+                    callback_data="nav:exchange",
+                ),
+            ],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+def build_bonus_system_kb(ref_link: str, use_ce: bool = True) -> InlineKeyboardMarkup:
+    share_text = "Забирай бесплатные гайды по ИИ и бонусные звёзды в боте!"
+    share_url = (
+        f"https://t.me/share/url?url={urllib.parse.quote(ref_link)}"
+        f"&text={urllib.parse.quote(share_text)}"
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _btn(
+                    text="Скопировать реферальную ссылку",
+                    emoji_key="link",
+                    fallback_prefix="🔗",
+                    use_ce=use_ce,
+                    copy_text=CopyTextButton(text=ref_link),
+                    style=ButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                _btn(
+                    text="Пригласить друга",
+                    emoji_key="rocket",
+                    fallback_prefix="🚀",
+                    use_ce=use_ce,
+                    url=share_url,
+                    style=ButtonStyle.SUCCESS,
+                )
+            ],
+            [
+                _btn(
+                    text="Обмен бонусов",
+                    emoji_key="exchange",
+                    fallback_prefix="🔁",
+                    use_ce=use_ce,
+                    callback_data="nav:exchange",
+                ),
+                _btn(
+                    text="Профиль",
+                    emoji_key="id_card",
+                    fallback_prefix="🪪",
+                    use_ce=use_ce,
+                    callback_data="nav:profile",
+                ),
+            ],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+def build_exchange_kb(
+    items: list[dict[str, Any]], user_bonus: int, use_ce: bool = True
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        cost = int(item.get("price_bonus_stars") or 0)
+        can_afford = user_bonus >= cost
+        rows.append(
+            [
+                _btn(
+                    text=f"{item['title']} • {cost} ⭐️"[:64],
+                    emoji_key="gift" if can_afford else "diamond",
+                    fallback_prefix="🎁" if can_afford else "💎",
+                    use_ce=use_ce,
+                    callback_data=f"item:view:{item['id']}",
+                    style=ButtonStyle.SUCCESS if can_afford else ButtonStyle.PRIMARY,
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            _btn(
+                text="Как заработать звёзды?",
+                emoji_key="star",
+                fallback_prefix="⭐️",
+                use_ce=use_ce,
+                callback_data="nav:bonuses",
+                style=ButtonStyle.SUCCESS,
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_sub_gate_kb(
+    channel_url: str, retry_callback: str = "sub:check:home", use_ce: bool = True
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if channel_url:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text="📢 Подписаться на канал",
+                _btn(
+                    text="Подписаться на канал",
+                    emoji_key="rocket",
+                    fallback_prefix="📢",
+                    use_ce=use_ce,
                     url=channel_url,
                     style=ButtonStyle.PRIMARY,
                 )
@@ -89,8 +300,11 @@ def build_sub_gate_kb(channel_url: str, retry_callback: str = "sub:check:home") 
         )
     rows.append(
         [
-            InlineKeyboardButton(
-                text="✅ Я подписался — продолжить",
+            _btn(
+                text="Я подписался — продолжить",
+                emoji_key="check",
+                fallback_prefix="✅",
+                use_ce=use_ce,
                 callback_data=retry_callback,
                 style=ButtonStyle.SUCCESS,
             )
@@ -106,14 +320,18 @@ def build_catalog_kb(
     settings: dict[str, str],
     in_category: bool = False,
 ) -> InlineKeyboardMarkup:
+    use_ce = settings.get("use_custom_emoji", "1") == "1"
     rows: list[list[InlineKeyboardButton]] = []
 
     for cat in categories:
         cnt = int(cat.get("active_count") or 0)
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"📁 {cat['title']} ({cnt})",
+                _btn(
+                    text=f"{cat['title']} ({cnt})",
+                    emoji_key="books" if section == "guides" else "bags",
+                    fallback_prefix="📁",
+                    use_ce=use_ce,
                     callback_data=f"cat:{section}:{cat['id']}",
                     style=ButtonStyle.PRIMARY,
                 )
@@ -123,17 +341,29 @@ def build_catalog_kb(
     for item in items:
         if item.get("is_paid"):
             badge = format_price_badge(item, settings)
-            label = f"💎 {item['title']} • {badge}"
+            rows.append(
+                [
+                    _btn(
+                        text=f"{item['title']} • {badge}"[:64],
+                        emoji_key="diamond",
+                        fallback_prefix="💎",
+                        use_ce=use_ce,
+                        callback_data=f"item:view:{item['id']}",
+                    )
+                ]
+            )
         else:
-            label = f"📘 {item['title']}"
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=label[:64],
-                    callback_data=f"item:view:{item['id']}",
-                )
-            ]
-        )
+            rows.append(
+                [
+                    _btn(
+                        text=item["title"][:64],
+                        emoji_key="book",
+                        fallback_prefix="📘",
+                        use_ce=use_ce,
+                        callback_data=f"item:view:{item['id']}",
+                    )
+                ]
+            )
 
     if in_category:
         rows.append(
@@ -152,20 +382,30 @@ def build_catalog_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_my_items_kb(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def build_my_items_kb(
+    items: list[dict[str, Any]], use_ce: bool = True
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for item in items:
-        icon = "💎" if item.get("is_paid") else "📘"
+        is_paid = bool(item.get("is_paid"))
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"{icon} {item['title']}"[:64],
+                _btn(
+                    text=item["title"][:64],
+                    emoji_key="diamond" if is_paid else "book",
+                    fallback_prefix="💎" if is_paid else "📘",
+                    use_ce=use_ce,
                     callback_data=f"item:open:{item['id']}",
                     style=ButtonStyle.SUCCESS,
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ В профиль", callback_data="nav:profile"),
+            InlineKeyboardButton(text="🏠 Меню", callback_data="nav:home"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -177,24 +417,31 @@ def build_item_card_kb(
     is_admin: bool = False,
     bot_username: str = "",
 ) -> InlineKeyboardMarkup:
+    use_ce = settings.get("use_custom_emoji", "1") == "1"
     rows: list[list[InlineKeyboardButton]] = []
     item_id = item["id"]
 
     if has_access:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text="📂 Открыть материал",
+                _btn(
+                    text="Открыть материал",
+                    emoji_key="check",
+                    fallback_prefix="📂",
+                    use_ce=use_ce,
                     callback_data=f"item:open:{item_id}",
                     style=ButtonStyle.SUCCESS,
                 )
             ]
         )
-    elif not item.get("is_paid"):
+    elif not item.get("is_paid") and int(item.get("price_bonus_stars") or 0) <= 0:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text="📥 Забрать бесплатно",
+                _btn(
+                    text="Забрать бесплатно",
+                    emoji_key="gift",
+                    fallback_prefix="📥",
+                    use_ce=use_ce,
                     callback_data=f"item:claim:{item_id}",
                     style=ButtonStyle.SUCCESS,
                 )
@@ -208,8 +455,11 @@ def build_item_card_kb(
         ):
             rows.append(
                 [
-                    InlineKeyboardButton(
-                        text=f"⭐️ Купить за {item['price_stars']} Stars",
+                    _btn(
+                        text=f"Купить за {item['price_stars']} TG Stars",
+                        emoji_key="star",
+                        fallback_prefix="⭐️",
+                        use_ce=use_ce,
                         callback_data=f"pay:stars:{item_id}",
                         style=ButtonStyle.PRIMARY,
                     )
@@ -217,14 +467,33 @@ def build_item_card_kb(
             )
             pay_buttons_added = True
 
+        bonus_cost = int(item.get("price_bonus_stars") or 0)
+        if bonus_cost > 0:
+            rows.append(
+                [
+                    _btn(
+                        text=f"Обменять за {bonus_cost} бонусных ⭐️",
+                        emoji_key="gift",
+                        fallback_prefix="🎁",
+                        use_ce=use_ce,
+                        callback_data=f"pay:bonus:{item_id}",
+                        style=ButtonStyle.SUCCESS,
+                    )
+                ]
+            )
+            pay_buttons_added = True
+
         if (
-            settings.get("enable_manual_pay", "1") == "1"
+            settings.get("enable_manual_pay", "0") == "1"
             and int(item.get("price_rub") or 0) > 0
         ):
             rows.append(
                 [
-                    InlineKeyboardButton(
-                        text=f"💳 Оплатить переводом ({item['price_rub']} ₽)",
+                    _btn(
+                        text=f"Оплатить переводом ({item['price_rub']} ₽)",
+                        emoji_key="money",
+                        fallback_prefix="💳",
+                        use_ce=use_ce,
                         callback_data=f"pay:manual:{item_id}",
                         style=ButtonStyle.SUCCESS,
                     )
@@ -345,7 +614,7 @@ def build_admin_main_kb(pending_orders: int = 0) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить гайд / товар",
+                    text="➕ Добавить гайд / товар в каталог",
                     callback_data="adm:add_item",
                     style=ButtonStyle.SUCCESS,
                 )
@@ -359,6 +628,17 @@ def build_admin_main_kb(pending_orders: int = 0) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📁 Категории",
                     callback_data="adm:cats",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐️ Рефералка и бонусы",
+                    callback_data="adm:ref_settings",
+                    style=ButtonStyle.SUCCESS,
+                ),
+                InlineKeyboardButton(
+                    text="✨ Узнать ID эмодзи",
+                    callback_data="adm:emoji_id",
                 ),
             ],
             [
@@ -395,12 +675,36 @@ def build_admin_main_kb(pending_orders: int = 0) -> InlineKeyboardMarkup:
 
 def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     req_sub = "🟢 Вкл" if settings.get("require_sub") == "1" else "🔴 Выкл"
-    paid_sec = "🟢 Виден" if settings.get("show_paid_section") == "1" else "🔴 Скрыт"
-    stars_on = "🟢 Вкл" if settings.get("enable_stars") == "1" else "🔴 Выкл"
-    manual_on = "🟢 Вкл" if settings.get("enable_manual_pay") == "1" else "🔴 Выкл"
+    paid_sec = "🟢 Виден" if settings.get("show_paid_section", "1") == "1" else "🔴 Скрыт"
+    ce_on = "🟢 Вкл" if settings.get("use_custom_emoji", "1") == "1" else "🔴 Выкл"
+    prof_home = (
+        "🟢 Вкл" if settings.get("show_profile_in_home", "1") == "1" else "🔴 Выкл"
+    )
+    stars_on = "🟢 Вкл" if settings.get("enable_stars", "1") == "1" else "🔴 Выкл"
+    manual_on = "🟢 Вкл" if settings.get("enable_manual_pay", "0") == "1" else "🔴 Выкл"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐️ Настройки рефералки и бонусов",
+                    callback_data="adm:ref_settings",
+                    style=ButtonStyle.SUCCESS,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"✨ Кастомные эмодзи: {ce_on}",
+                    callback_data="adm:set_toggle:use_custom_emoji",
+                    style=ButtonStyle.PRIMARY
+                    if settings.get("use_custom_emoji", "1") == "1"
+                    else None,
+                ),
+                InlineKeyboardButton(
+                    text=f"🪪 Профиль в /start: {prof_home}",
+                    callback_data="adm:set_toggle:show_profile_in_home",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text=f"🔒 Подписка на канал: {req_sub}",
@@ -422,20 +726,20 @@ def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text=f"🔥 Раздел «Продукты»: {paid_sec}",
+                    text=f"🛒 Раздел «Каталог»: {paid_sec}",
                     callback_data="adm:set_toggle:show_paid_section",
                     style=ButtonStyle.PRIMARY
-                    if settings.get("show_paid_section") == "1"
+                    if settings.get("show_paid_section", "1") == "1"
                     else None,
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=f"⭐️ Оплата Stars: {stars_on}",
+                    text=f"⭐️ Оплата TG Stars: {stars_on}",
                     callback_data="adm:set_toggle:enable_stars",
                 ),
                 InlineKeyboardButton(
-                    text=f"💳 Полуавтомат: {manual_on}",
+                    text=f"💳 Полуавтомат ₽: {manual_on}",
                     callback_data="adm:set_toggle:enable_manual_pay",
                 ),
             ],
@@ -455,7 +759,7 @@ def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
                     callback_data="adm:set_edit:welcome_text",
                 ),
                 InlineKeyboardButton(
-                    text="🖼 Обложка /start",
+                    text="🖼 Баннер /start",
                     callback_data="adm:set_photo:welcome_photo_id",
                 ),
             ],
@@ -474,6 +778,67 @@ def build_admin_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     )
 
 
+def build_admin_ref_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    r_join = settings.get("ref_join_bonus", "1")
+    r_first = settings.get("ref_first_buy_bonus", "15")
+    r_rep = settings.get("ref_repeat_buy_bonus", "5")
+    s_first = settings.get("self_first_buy_bonus", "20")
+    s_rep = settings.get("self_repeat_buy_bonus", "5")
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"👥 За приглашённого друга: +{r_join} ⭐️",
+                    callback_data="adm:set_edit:ref_join_bonus",
+                    style=ButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔥 Рефереру за 1-ю покупку друга: +{r_first} ⭐️",
+                    callback_data="adm:set_edit:ref_first_buy_bonus",
+                    style=ButtonStyle.SUCCESS,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔄 Рефереру за след. покупки: +{r_rep} ⭐️",
+                    callback_data="adm:set_edit:ref_repeat_buy_bonus",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🛍 Покупателю за 1-ю покупку: +{s_first} ⭐️",
+                    callback_data="adm:set_edit:self_first_buy_bonus",
+                ),
+                InlineKeyboardButton(
+                    text=f"🛍 За следующие: +{s_rep} ⭐️",
+                    callback_data="adm:set_edit:self_repeat_buy_bonus",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Баннер раздела «Бонусная система»",
+                    callback_data="adm:set_photo:bonus_banner_photo_id",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Начислить / списать бонусы по ID",
+                    callback_data="adm:bonus_give",
+                    style=ButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В админку", callback_data="adm:menu"
+                )
+            ],
+        ]
+    )
+
+
 def build_admin_item_manage_kb(
     item: dict[str, Any], bot_username: str
 ) -> InlineKeyboardMarkup:
@@ -481,9 +846,9 @@ def build_admin_item_manage_kb(
     deep_link = f"https://t.me/{bot_username}?start=item_{item_id}"
     active_label = "🟢 Опубликован" if item.get("is_active") else "🔴 Скрыт"
     paid_label = (
-        "💎 Тип: Платный товар (сделать бесплатным)"
+        "💎 Раздел: Каталог (перенести в Гайды)"
         if item.get("is_paid")
-        else "📘 Тип: Бесплатный гайд (сделать платным)"
+        else "📘 Раздел: Гайды (перенести в Каталог)"
     )
 
     return InlineKeyboardMarkup(
@@ -514,13 +879,21 @@ def build_admin_item_manage_kb(
             ],
             [
                 InlineKeyboardButton(
-                    text=f"💳 Цена ₽ ({item.get('price_rub', 0)})",
-                    callback_data=f"adm:item_edit:{item_id}:price_rub",
+                    text=f"⭐️ Цена TG Stars ({item.get('price_stars', 0)})",
+                    callback_data=f"adm:item_edit:{item_id}:price_stars",
+                    style=ButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
-                    text=f"⭐️ Цена Stars ({item.get('price_stars', 0)})",
-                    callback_data=f"adm:item_edit:{item_id}:price_stars",
+                    text=f"🎁 За бонусы ({item.get('price_bonus_stars', 0)} ⭐️)",
+                    callback_data=f"adm:item_edit:{item_id}:price_bonus_stars",
+                    style=ButtonStyle.SUCCESS,
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Цена в рублях ({item.get('price_rub', 0)} ₽)",
+                    callback_data=f"adm:item_edit:{item_id}:price_rub",
+                )
             ],
             [
                 InlineKeyboardButton(
