@@ -534,6 +534,22 @@ class Database:
                 )
                 return int(new_bal)
 
+    async def get_user_bonus_history(
+        self, user_id: int, limit: int = 15
+    ) -> list[dict[str, Any]]:
+        pool = self._require_pool()
+        rows = await pool.fetch(
+            """
+            SELECT * FROM bonus_transactions
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
     async def set_user_blocked(self, user_id: int, blocked: bool = True) -> None:
         pool = self._require_pool()
         await pool.execute(

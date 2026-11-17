@@ -6,11 +6,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-DEFAULT_WELCOME_TEXT = (
-    '<tg-emoji emoji-id="5435957248314579621">⭐️</tg-emoji> <b>Добро пожаловать в НейроАдмин!</b> '
-    '<tg-emoji emoji-id="5226512880362332956">📖</tg-emoji>\n\n'
-    "Здесь собраны бесплатные гайды, закрытые материалы, каталог цифровых товаров и бонусная система."
-)
+DEFAULT_WELCOME_TEXT = "<b>o/ Добро пожаловать в НейроАдмин!</b>"
 
 DEFAULT_INFO_TEXT = (
     "ℹ️ <b>О проекте и навигация</b>\n\n"

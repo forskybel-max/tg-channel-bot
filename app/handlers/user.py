@@ -39,9 +39,10 @@ from app.services.subscription import check_user_subscription
 logger = logging.getLogger(__name__)
 
 SUB_GATE_TEXT = (
-    "🔒 <b>Доступ к боту открыт только для подписчиков канала!</b>\n\n"
-    "Чтобы пользоваться ботом, открывать бесплатные гайды, каталог и получать бонусные звёзды, "
-    "подпишитесь на наш канал и нажмите зелёную кнопку проверки ниже 👇"
+    '<tg-emoji emoji-id="5296369303661067030">🔒</tg-emoji> '
+    "<b>Доступ к боту открыт только для подписчиков канала!</b>\n\n"
+    "Чтобы открывать бесплатные гайды, пользоваться каталогом и получать бонусные звёзды, "
+    'подпишитесь на наш канал и нажмите кнопку проверки ниже <tg-emoji emoji-id="5406745015365943482">⬇️</tg-emoji>'
 )
 
 
@@ -55,6 +56,15 @@ def _parse_ref_id(payload: str) -> int | None:
         if raw.isdigit():
             return int(raw)
     return None
+
+
+def _build_progress_bar(current: int, target: int) -> tuple[str, int]:
+    if target <= 0:
+        target = 100
+    pct = min(100, int((current / target) * 100))
+    filled = min(10, round((pct / 100) * 10))
+    bar = "■" * filled + "□" * (10 - filled)
+    return bar, pct
 
 
 async def notify_referrer_if_needed(bot: Bot, db: Database, user_id: int) -> None:
@@ -77,12 +87,12 @@ async def notify_referrer_if_needed(bot: Bot, db: Database, user_id: int) -> Non
     star_word = (
         "бонусная звезда начислена"
         if bonus == 1
-        else f"бонусных звёзд начислено"
+        else "бонусных звёзд начислено"
     )
     msg_text = (
         f"{ce('rocket', use_ce)} <b>Приглашение успешно!</b>\n\n"
         f"{ce('check_box', use_ce)} Твой друг {friend_label} присоединился к боту\n\n"
-        f"{ce('star', use_ce)} <b>+{bonus} {star_word}</b>"
+        f"{ce('news_star', use_ce)} <b>+{bonus} {star_word}</b>"
     )
     try:
         await bot.send_message(
@@ -91,7 +101,9 @@ async def notify_referrer_if_needed(bot: Bot, db: Database, user_id: int) -> Non
             parse_mode="HTML",
         )
     except Exception as exc:
-        logger.debug("Не удалось отправить пуш рефереру %s: %s", reward["referrer_id"], exc)
+        logger.debug(
+            "Не удалось отправить пуш рефереру %s: %s", reward["referrer_id"], exc
+        )
 
 
 class SubscriptionGateMiddleware(BaseMiddleware):
@@ -335,7 +347,7 @@ def format_item_card_text(
     icon = (
         ce("diamond", use_ce)
         if item.get("is_paid")
-        else ce("book", use_ce)
+        else ce("grad_cap", use_ce)
     )
     title = html.escape(item.get("title", "Материал"))
     desc = (item.get("description") or "").strip()
@@ -343,12 +355,12 @@ def format_item_card_text(
     if has_access:
         status_line = f"{ce('check', use_ce)} <b>Доступ открыт</b>"
     elif not item.get("is_paid") and int(item.get("price_bonus_stars") or 0) <= 0:
-        status_line = f"{ce('gift', use_ce)} <b>Доступно бесплатно</b>"
+        status_line = f"{ce('free', use_ce)} <b>Доступно бесплатно</b>"
     else:
         badge = format_price_badge(item, settings)
         status_line = f"{ce('star', use_ce)} <b>Стоимость:</b> {badge}"
         if int(item.get("price_bonus_stars") or 0) > 0:
-            status_line += f"\n{ce('coin', use_ce)} <b>Ваши бонусы:</b> {user_bonus} ⭐️"
+            status_line += f"\n{ce('dizzy_star', use_ce)} <b>Ваши бонусы:</b> {user_bonus} ⭐️"
 
     parts = [f"{icon} <b>{title}</b>"]
     if desc:
@@ -378,20 +390,26 @@ def setup_user_router(config: Config, db: Database) -> Router:
         channel_url = settings.get("channel_url", "").strip()
         welcome_text = (
             settings.get("welcome_text", "").strip()
-            or f"{ce('star', use_ce)} <b>Добро пожаловать!</b>"
+            or "<b>o/ Добро пожаловать в НейроАдмин!</b>"
         )
         welcome_photo = settings.get("welcome_photo_id", "").strip()
 
         if settings.get("show_profile_in_home", "1") == "1":
             u = await db.get_user(user_id)
             bonus_stars = int(u["bonus_stars"]) if u else 0
-            refs_cnt = int(u["referrals_count"]) if u else 0
+            orders_cnt = int(u["paid_orders_count"]) if u else 0
             profile_block = (
                 f"{ce('id_card', use_ce)} Telegram ID: <code>{user_id}</code>\n"
-                f"{ce('star', use_ce)} Бонусы: <b>{bonus_stars} ⭐️</b>\n"
-                f"{ce('users', use_ce)} Рефералов: <b>{refs_cnt}</b>"
+                f"{ce('money_bag', use_ce)} Покупок: <b>{orders_cnt}</b>\n"
+                f"{ce('star', use_ce)} Бонусы: <b>{bonus_stars}</b>\n\n"
+                f"<b>Выберите раздел ниже</b> {ce('arrow_down', use_ce)}"
             )
-            welcome_text = f"{welcome_text}\n\n{profile_block}"
+            full_text = f"{welcome_text}\n\n{profile_block}"
+        else:
+            full_text = (
+                f"{welcome_text}\n\n"
+                f"<b>Выберите раздел ниже</b> {ce('arrow_down', use_ce)}"
+            )
 
         kb = build_main_menu_kb(
             show_paid_section=show_paid,
@@ -399,7 +417,7 @@ def setup_user_router(config: Config, db: Database) -> Router:
             channel_url=channel_url,
             use_ce=use_ce,
         )
-        await render_screen(event, welcome_text, kb, photo_id=welcome_photo)
+        await render_screen(event, full_text, kb, photo_id=welcome_photo)
 
     async def show_item_card(
         event: Message | CallbackQuery,
@@ -419,7 +437,9 @@ def setup_user_router(config: Config, db: Database) -> Router:
         else:
             back_cb = "nav:shop" if item.get("is_paid") else "nav:guides"
 
-        card_text = format_item_card_text(item, settings, has_access, user_bonus=user_bonus)
+        card_text = format_item_card_text(
+            item, settings, has_access, user_bonus=user_bonus
+        )
         kb = build_item_card_kb(
             item=item,
             has_access=has_access,
@@ -534,18 +554,20 @@ def setup_user_router(config: Config, db: Database) -> Router:
         )
 
         if section == "guides":
-            header = f"{ce('books', use_ce)} <b>Бесплатные гайды и база знаний</b>"
+            header = f"{ce('grad_cap', use_ce)} <b>Бесплатные гайды и база знаний</b>"
+            sub_line = "Выберите нужный раздел или гайд из списка ниже:"
             empty_hint = (
                 "Здесь пока нет опубликованных гайдов. Скоро добавим свежие материалы!"
             )
         else:
-            header = f"{ce('cart', use_ce)} <b>Каталог товаров и доступов</b>"
+            header = f"{ce('cart', use_ce)} <b>Каталог</b>"
+            sub_line = "Выберите из списка то, что вам нужно:"
             empty_hint = "Товары в каталоге сейчас пополняются. Загляните чуть позже!"
 
         if not categories and not uncat_items:
             text = f"{header}\n\n<i>{empty_hint}</i>"
         else:
-            text = f"{header}\n\n{ce('point_down', use_ce)} Выберите нужную категорию или позицию:"
+            text = f"{header}\n<i>{sub_line}</i> {ce('arrow_down', use_ce)}"
 
         kb = build_catalog_kb(
             section=section,
@@ -574,10 +596,10 @@ def setup_user_router(config: Config, db: Database) -> Router:
         settings = await db.get_all_settings()
         use_ce = settings.get("use_custom_emoji", "1") == "1"
         items = await db.get_catalog_items(is_paid=is_paid, category_id=cat_id)
-        icon = ce("books" if section == "guides" else "bags", use_ce)
+        icon = ce("folder" if section == "guides" else "pink_bags", use_ce)
         text = (
             f"{icon} <b>{html.escape(category['title'])}</b>\n\n"
-            f"{ce('point_down', use_ce)} Доступные материалы в разделе:"
+            f"Выберите нужную позицию {ce('arrow_down', use_ce)}"
         )
         if not items:
             text = f"{icon} <b>{html.escape(category['title'])}</b>\n\n<i>В этой категории пока пусто.</i>"
@@ -608,14 +630,14 @@ def setup_user_router(config: Config, db: Database) -> Router:
         uname_str = f"@{call.from_user.username}" if call.from_user.username else "—"
 
         text = (
-            f"{ce('id_card', use_ce)} <b>Личный профиль</b>\n\n"
-            f"▪ <b>Telegram ID:</b> <code>{uid}</code>\n"
-            f"▪ <b>Username:</b> {html.escape(uname_str)}\n"
-            f"▪ <b>Бонусный баланс:</b> <b>{bonus_stars}</b> {ce('star', use_ce)}\n"
-            f"▪ <b>Приглашено друзей:</b> <b>{refs_cnt}</b> {ce('users', use_ce)}\n"
-            f"▪ <b>Покупок в каталоге:</b> <b>{orders_cnt}</b>\n"
-            f"▪ <b>Открыто материалов:</b> <b>{len(owned)}</b>\n\n"
-            f"{ce('link', use_ce)} <b>Ваша реф. ссылка:</b>\n<code>{ref_link}</code>"
+            f"{ce('shield', use_ce)} <b>Личный профиль</b>\n\n"
+            f"{ce('id_card', use_ce)} Telegram ID: <code>{uid}</code>\n"
+            f"👤 Username: {html.escape(uname_str)}\n"
+            f"{ce('money_bag', use_ce)} Покупок: <b>{orders_cnt}</b>\n"
+            f"{ce('star', use_ce)} Бонусы: <b>{bonus_stars}</b>\n"
+            f"{ce('users', use_ce)} Приглашено друзей: <b>{refs_cnt}</b>\n"
+            f"{ce('gift', use_ce)} Открыто материалов: <b>{len(owned)}</b>\n\n"
+            f"{ce('link', use_ce)} <b>Твоя ссылка:</b>\n{ref_link}"
         )
         await render_screen(call, text, build_profile_kb(use_ce=use_ce))
 
@@ -639,21 +661,22 @@ def setup_user_router(config: Config, db: Database) -> Router:
         s_rep = settings.get("self_repeat_buy_bonus", "5")
         banner_id = settings.get("bonus_banner_photo_id", "").strip()
 
-        star_ic = ce("star", use_ce)
+        star_ic = ce("news_star", use_ce)
         text = (
-            f"{ce('sparkle', use_ce)} <b>Бонусная система</b>\n"
-            f"Приглашай друзей — получай звёзды!\n\n"
-            f"{ce('bags', use_ce)} <b>Покупай сам</b>\n"
-            f"▪ Первая покупка → <b>+{s_first}</b> {star_ic}\n"
-            f"▪ Каждая следующая → <b>+{s_rep}</b> {star_ic}\n\n"
+            f"<b>Приглашай друзей — получай звёзды</b> {ce('laptop', use_ce)}\n\n"
+            f"{ce('pink_bags', use_ce)} <b>Покупай сам</b>\n"
+            f"▪ Первая покупка → <b>{s_first}</b> {star_ic}\n"
+            f"▪ Каждая следующая → <b>{s_rep}</b> {star_ic}\n\n"
             f"{ce('users', use_ce)} <b>Приглашай друзей</b>\n"
-            f"▪ Новый друг по ссылке → <b>+{r_join}</b> {star_ic}\n"
-            f"▪ Его первая покупка → <b>+{r_first}</b> {star_ic}\n"
-            f"▪ Его следующие покупки → <b>+{r_rep}</b> {star_ic}\n\n"
-            f"{ce('coin', use_ce)} <b>Твои бонусы:</b> <b>{bonus_stars}</b> {star_ic} "
-            f"(друзей: <b>{refs_cnt}</b>)\n\n"
-            f"{ce('link', use_ce)} <b>Твоя ссылка для приглашений:</b>\n"
-            f"<code>{ref_link}</code>"
+            f"▪ Новый друг по ссылке → <b>{r_join}</b> {star_ic}\n"
+            f"▪ Его первая покупка → <b>{r_first}</b> {star_ic}\n"
+            f"▪ Его следующие покупки → <b>по {r_rep}</b> {star_ic} <b>тебе и другу</b>\n\n"
+            f"<i>Количество звёзд зависит от активности</i>\n\n"
+            f"{ce('link', use_ce)} <b>Твоя ссылка:</b>\n"
+            f"{ref_link}\n"
+            f"{'─' * 22}\n"
+            f"👤 <b>Приглашено друзей: {refs_cnt}</b>\n"
+            f"{star_ic} <b>Твой баланс: {bonus_stars}</b>"
         )
         await render_screen(
             call,
@@ -672,27 +695,92 @@ def setup_user_router(config: Config, db: Database) -> Router:
         bonus_stars = int(u["bonus_stars"]) if u else 0
         items = await db.get_bonus_exchange_items()
 
-        header = (
-            f"{ce('exchange', use_ce)} <b>Обмен бонусных звёзд</b>\n\n"
-            f"{ce('coin', use_ce)} Ваш доступный баланс: <b>{bonus_stars}</b> {ce('star', use_ce)}\n\n"
-        )
-        if not items:
-            text = (
-                f"{header}"
-                "<i>Сейчас список бонусных товаров пополняется. "
-                "Приглашайте друзей и копите звёзды — скоро здесь появятся эксклюзивные материалы!</i>"
-            )
+        dizzy = ce("dizzy_star", use_ce)
+        if items:
+            reward_lines = [f"{ce('gift', use_ce)} <b>ДОСТУПНЫЕ НАГРАДЫ:</b>"]
+            costs: list[int] = []
+            for it in items[:10]:
+                c = int(it.get("price_bonus_stars") or 0)
+                costs.append(c)
+                reward_lines.append(
+                    f"▪ <b>{c}</b> {dizzy} — <i>{html.escape(it['title'])}</i>"
+                )
+            quote_block = "<blockquote>" + "\n".join(reward_lines) + "</blockquote>"
+            higher_costs = [c for c in costs if c > bonus_stars]
+            target_cost = min(higher_costs) if higher_costs else max(costs)
         else:
-            text = (
-                f"{header}"
-                f"{ce('point_down', use_ce)} Выберите товар, который хотите забрать за накопленные бонусные звёзды:"
+            quote_block = (
+                f"<blockquote>{ce('gift', use_ce)} <b>ДОСТУПНЫЕ НАГРАДЫ:</b>\n"
+                f"▪ <i>Список наград за бонусы скоро пополнится!</i></blockquote>"
             )
+            target_cost = 100
+
+        bar_str, pct = _build_progress_bar(bonus_stars, target_cost)
+
+        text = (
+            f"<b>Твои звёзды — твои награды</b> {ce('shush', use_ce)}\n\n"
+            "<i>Копи звёзды за покупки и приглашения друзей, а здесь обменивай их на доступы и закрытые материалы.</i>\n\n"
+            f"{quote_block}\n\n"
+            "<b>Заглядывай чаще:</b> будем добавлять новые награды и обновлять предложения\n"
+            f"{'─' * 22}\n"
+            f"{dizzy} <b>Ваш баланс: {bonus_stars} / {target_cost} бонусов</b>\n"
+            f"<code>{bar_str}</code> {pct}%"
+        )
 
         await render_screen(
             call,
             text,
             build_exchange_kb(items=items, user_bonus=bonus_stars, use_ce=use_ce),
         )
+
+    @router.callback_query(F.data == "nav:bonus_history")
+    async def cb_bonus_history(call: CallbackQuery) -> None:
+        await call.answer()
+        uid = call.from_user.id
+        settings = await db.get_all_settings()
+        use_ce = settings.get("use_custom_emoji", "1") == "1"
+        txs = await db.get_user_bonus_history(uid, limit=15)
+
+        reason_labels = {
+            "ref_join": "Приглашение друга",
+            "ref_first_buy": "1-я покупка друга",
+            "ref_repeat_buy": "Покупка друга",
+            "self_first_buy": "Кэшбэк за 1-ю покупку",
+            "self_repeat_buy": "Кэшбэк за покупку",
+            "spend_bonus": "Обмен бонусов на товар",
+            "admin_adjust": "Начисление администратором",
+        }
+
+        if not txs:
+            body = "<i>У вас пока нет операций по бонусному балансу.</i>"
+        else:
+            lines = []
+            for tx in txs:
+                amt = int(tx["amount"])
+                sign = f"+{amt}" if amt > 0 else str(amt)
+                r_label = reason_labels.get(tx["reason"], tx["reason"])
+                dt = tx["created_at"].strftime("%d.%m %H:%M") if tx.get("created_at") else ""
+                lines.append(
+                    f"▪ <code>{dt}</code> — <b>{sign}</b> {ce('news_star', use_ce)} ({r_label})"
+                )
+            body = "\n".join(lines)
+
+        text = f"{ce('receipt', use_ce)} <b>История бонусов</b>\n\n{body}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="↩️ К бонусной системе", callback_data="nav:bonuses"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню", callback_data="nav:home"
+                    )
+                ],
+            ]
+        )
+        await render_screen(call, text, kb)
 
     @router.callback_query(F.data.startswith("item:view:"))
     async def cb_item_view(call: CallbackQuery, bot: Bot) -> None:
@@ -759,12 +847,12 @@ def setup_user_router(config: Config, db: Database) -> Router:
             text = (
                 f"{ce('gift', use_ce)} <b>Мои материалы и покупки</b>\n\n"
                 "У вас пока нет открытых гайдов или покупок.\n"
-                "Загляните в раздел <b>«📚 Гайды»</b> или <b>«🛒 Каталог»</b>!"
+                "Загляните в раздел <b>«БЕСПЛАТНЫЕ ГАЙДЫ»</b> или <b>«Каталог»</b>!"
             )
         else:
             text = (
                 f"{ce('gift', use_ce)} <b>Мои материалы ({len(items)})</b>\n\n"
-                f"{ce('point_down', use_ce)} Нажмите на любой материал, чтобы открыть его снова:"
+                f"Нажмите на любой материал, чтобы открыть его снова {ce('arrow_down', use_ce)}"
             )
         await render_screen(call, text, build_my_items_kb(items, use_ce=use_ce))
 
@@ -772,18 +860,20 @@ def setup_user_router(config: Config, db: Database) -> Router:
     async def cb_info(call: CallbackQuery) -> None:
         await call.answer()
         settings = await db.get_all_settings()
-        use_ce = settings.get("use_custom_emoji", "1") == "1"
         info_text = settings.get("info_text", "ℹ️ Информация скоро появится.")
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="💬 Связь с автором",
+                        text="💬 Поддержка",
                         callback_data="nav:support",
-                        style=ButtonStyle.PRIMARY,
                     )
                 ],
-                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Главное меню", callback_data="nav:home"
+                    )
+                ],
             ]
         )
         await render_screen(call, info_text, kb)
@@ -846,9 +936,8 @@ def setup_user_router(config: Config, db: Database) -> Router:
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="🏠 Главное меню",
+                            text="↩️ Главное меню",
                             callback_data="nav:home",
-                            style=ButtonStyle.PRIMARY,
                         )
                     ]
                 ]
